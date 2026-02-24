@@ -183,6 +183,35 @@ for more information on patterns.
 This keyword may appear multiple times in
 .Nm
 with each instance appending to the list.
+.It Cm ForwardProxy
+Specifies an optional proxy used for outbound
+.Dq direct-tcpip
+connections.
+The argument must be of the form
+.Ar scheme://host : port
+or
+.Ar scheme://user : password @ host : port .
+Supported proxy schemes are
+.Cm http ,
+.Cm socks4
+and
+.Cm socks5 .
+For backward compatibility,
+.Cm host : port
+or
+.Ar user : password @ host : port
+without a scheme are treated as HTTP.
+When set, direct TCP forwarding connections are established via the
+configured proxy instead of directly to the target.
+This option applies to direct TCP forwarding channels and does not affect
+shell/session traffic.
+The default is
+.Cm none .
+.Pp
+The legacy keyword
+.Cm ForwardHttpProxy
+is accepted as an alias for
+.Cm ForwardProxy .
 .It Cm AuthenticationMethods
 Specifies the authentication methods that must be successfully completed
 for a user to be granted access.
@@ -1320,6 +1349,8 @@ Available keywords are
 .Cm DenyUsers ,
 .Cm DisableForwarding ,
 .Cm ExposeAuthInfo ,
+.Cm ForwardHttpProxy ,
+.Cm ForwardProxy ,
 .Cm ForceCommand ,
 .Cm GatewayPorts ,
 .Cm GSSAPIAuthentication ,

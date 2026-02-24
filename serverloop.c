@@ -446,8 +446,14 @@ server_request_direct_tcpip(struct ssh *ssh, int *reason, const char **errmsg)
 	if ((options.allow_tcp_forwarding & FORWARD_LOCAL) != 0 &&
 	    auth_opts->permit_port_forwarding_flag &&
 	    !options.disable_forwarding) {
-		c = channel_connect_to_port(ssh, target, target_port,
-		    "direct-tcpip", "direct-tcpip", reason, errmsg);
+		if (options.forward_http_proxy != NULL) {
+			c = channel_connect_to_port_via_proxy(ssh,
+			    target, target_port, options.forward_http_proxy,
+			    "direct-tcpip", "direct-tcpip", reason, errmsg);
+		} else {
+			c = channel_connect_to_port(ssh, target, target_port,
+			    "direct-tcpip", "direct-tcpip", reason, errmsg);
+		}
 	} else {
 		logit("refused local port forward: "
 		    "originator %s port %d, target %s port %d",

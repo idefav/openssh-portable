@@ -66,6 +66,243 @@ autoreconf
 make && make tests
 ```
 
+### Running targeted forwarding regress tests
+
+When you only want to validate dynamic forwarding paths (including
+``ForwardProxy``), you can run just these tests against the binaries in
+your current build tree:
+
+```
+make -C regress t-exec \
+	.CURDIR="$PWD/regress" .OBJDIR="$PWD/regress" OBJ="$PWD/regress" \
+	TEST_SHELL=sh \
+	LTESTS='dynamic-forward forward-http-proxy' \
+	TEST_SSH_UNSAFE_PERMISSIONS=1 \
+	TEST_SSH_SSH="$PWD/ssh" \
+	TEST_SSH_SSHD="$PWD/sshd" \
+	TEST_SSH_SSHD_SESSION="$PWD/sshd-session" \
+	TEST_SSH_SSHD_AUTH="$PWD/sshd-auth" \
+	TEST_SSH_SSHAGENT="$PWD/ssh-agent" \
+	TEST_SSH_SSHADD="$PWD/ssh-add" \
+	TEST_SSH_SSHKEYGEN="$PWD/ssh-keygen" \
+	TEST_SSH_SSHKEYSCAN="$PWD/ssh-keyscan" \
+	TEST_SSH_SFTP="$PWD/sftp" \
+	TEST_SSH_SFTPSERVER="$PWD/sftp-server" \
+	TEST_SSH_SCP="$PWD/scp"
+```
+
+The ``TEST_SSH_*`` overrides ensure the regress harness uses your freshly built
+binaries instead of any system-installed OpenSSH.
+
+If you prefer a compact one-liner, use:
+
+```
+BIN="$PWD"; make -C regress t-exec .CURDIR="$PWD/regress" .OBJDIR="$PWD/regress" OBJ="$PWD/regress" TEST_SHELL=sh LTESTS='dynamic-forward forward-http-proxy' TEST_SSH_UNSAFE_PERMISSIONS=1 TEST_SSH_SSH="$BIN/ssh" TEST_SSH_SSHD="$BIN/sshd" TEST_SSH_SSHD_SESSION="$BIN/sshd-session" TEST_SSH_SSHD_AUTH="$BIN/sshd-auth" TEST_SSH_SSHAGENT="$BIN/ssh-agent" TEST_SSH_SSHADD="$BIN/ssh-add" TEST_SSH_SSHKEYGEN="$BIN/ssh-keygen" TEST_SSH_SSHKEYSCAN="$BIN/ssh-keyscan" TEST_SSH_SFTP="$BIN/sftp" TEST_SSH_SFTPSERVER="$BIN/sftp-server" TEST_SSH_SCP="$BIN/scp"
+```
+
+To run only the ``forward-http-proxy`` test:
+
+```
+BIN="$PWD"; make -C regress t-exec .CURDIR="$PWD/regress" .OBJDIR="$PWD/regress" OBJ="$PWD/regress" TEST_SHELL=sh LTESTS='forward-http-proxy' TEST_SSH_UNSAFE_PERMISSIONS=1 TEST_SSH_SSH="$BIN/ssh" TEST_SSH_SSHD="$BIN/sshd" TEST_SSH_SSHD_SESSION="$BIN/sshd-session" TEST_SSH_SSHD_AUTH="$BIN/sshd-auth" TEST_SSH_SSHAGENT="$BIN/ssh-agent" TEST_SSH_SSHADD="$BIN/ssh-add" TEST_SSH_SSHKEYGEN="$BIN/ssh-keygen" TEST_SSH_SSHKEYSCAN="$BIN/ssh-keyscan" TEST_SSH_SFTP="$BIN/sftp" TEST_SSH_SFTPSERVER="$BIN/sftp-server" TEST_SSH_SCP="$BIN/scp"
+```
+
+### ForwardProxy update summary
+
+This repository now includes server-side support for server-side forwarding
+via upstream proxies using ``ForwardProxy``.
+
+Highlights:
+
+* Added ``ForwardProxy`` parsing and config plumbing in the server config
+	path.
+* Added server channel connect support for HTTP ``CONNECT`` and SOCKS
+	(``socks4``/``socks5``) tunneling.
+* Wired ``direct-tcpip`` handling to use the configured upstream proxy when
+	``ForwardProxy`` is set.
+* Documented ``ForwardProxy`` in ``sshd_config(5)``.
+* Added a regress test, ``regress/forward-http-proxy.sh``, that validates
+	dynamic forwarding through a local HTTP CONNECT proxy.
+
+Scope note:
+
+* This is implemented at server ``direct-tcpip`` channel handling scope.
+	Therefore, it applies to ``direct-tcpip`` channels handled by ``sshd``
+	(including dynamic forwarding traffic), rather than introducing a protocol
+	marker that uniquely identifies ``-D`` at the server.
+
+Validation performed:
+
+* ``make tests`` completed successfully in this environment.
+* Targeted regress runs passed for both
+	``dynamic-forward`` and ``forward-http-proxy``.
+
+Usage example:
+
+1) Configure server-side proxying in ``sshd_config`` (``http``/``socks4``/
+   ``socks5``):
+
+```
+AllowTcpForwarding yes
+ForwardProxy http://127.0.0.1:3081
+```
+
+	If your HTTP proxy requires authentication, include credentials:
+
+```
+AllowTcpForwarding yes
+ForwardProxy http://proxyuser:proxypass@127.0.0.1:3081
+```
+
+	This sends a ``Proxy-Authorization: Basic ...`` header on ``CONNECT``.
+
+	For SOCKS4/SOCKS5, switch by scheme:
+
+```
+AllowTcpForwarding yes
+ForwardProxy socks4://proxyuser@127.0.0.1:1080
+```
+
+```
+AllowTcpForwarding yes
+ForwardProxy socks5://proxyuser:proxypass@127.0.0.1:1080
+```
+
+2) Restart ``sshd`` and create a dynamic SOCKS tunnel from the client:
+
+```
+ssh -D 127.0.0.1:1080 -N user@server
+```
+
+3) Send traffic through the SOCKS tunnel (example with ``curl``):
+
+```
+curl --socks5-hostname 127.0.0.1:1080 http://example.com/
+```
+
+With ``ForwardProxy`` set, server handling of ``direct-tcpip`` channels
+(including traffic from ``-D`` dynamic forwarding) will egress through the
+configured HTTP or SOCKS proxy.
+
+Running ``sshd`` with a specific config file:
+
+``sshd`` supports an explicit config path via ``-f``.
+
+1) Validate config syntax before starting:
+
+```
+./sshd -t -f /path/to/sshd_config
+```
+
+2) Run in foreground (useful for debugging):
+
+```
+./sshd -D -e -f /path/to/sshd_config
+```
+
+3) Run with default daemon behaviour but custom config file:
+
+```
+./sshd -f /path/to/sshd_config
+```
+
+``sshd_config`` template (baseline/default style):
+
+The following example is a practical baseline template you can copy to start
+from (adjust paths/users for your system):
+
+```
+# Network
+Port 22
+AddressFamily any
+ListenAddress 0.0.0.0
+ListenAddress ::
+
+# Host keys (use the paths generated on your host)
+HostKey /etc/ssh/ssh_host_ed25519_key
+HostKey /etc/ssh/ssh_host_rsa_key
+
+# Authentication
+PermitRootLogin prohibit-password
+PubkeyAuthentication yes
+PasswordAuthentication yes
+KbdInteractiveAuthentication yes
+UsePAM yes
+
+# Session/security defaults
+X11Forwarding no
+PermitEmptyPasswords no
+ChallengeResponseAuthentication no
+PrintMotd no
+
+# Forwarding
+AllowTcpForwarding yes
+AllowAgentForwarding yes
+AllowStreamLocalForwarding yes
+# Upstream proxy for direct-tcpip (server-side forwarding egress)
+# Default disabled:
+ForwardProxy none
+#
+# Enable with one of the following formats:
+#   ForwardProxy http://127.0.0.1:3081
+#   ForwardProxy socks4://127.0.0.1:1080
+#   ForwardProxy socks5://127.0.0.1:1080
+#
+# With authentication:
+#   HTTP Basic auth:
+#     ForwardProxy http://proxyuser:proxypass@127.0.0.1:3081
+#   SOCKS4 user field:
+#     ForwardProxy socks4://proxyuser@127.0.0.1:1080
+#   SOCKS5 username/password auth:
+#     ForwardProxy socks5://proxyuser:proxypass@127.0.0.1:1080
+#
+# Legacy alias (kept for compatibility, maps to ForwardProxy):
+#   ForwardHttpProxy 127.0.0.1:3081
+
+# Keepalive
+ClientAliveInterval 0
+ClientAliveCountMax 3
+
+# SFTP subsystem
+Subsystem sftp /usr/local/libexec/sftp-server
+```
+
+Test template before reload/restart:
+
+```
+./sshd -t -f /path/to/sshd_config
+```
+
+Running ``sshd`` via ``systemd``:
+
+You can create a dedicated service unit that points to a specific config file.
+Example ``/etc/systemd/system/sshd-custom.service``:
+
+```
+[Unit]
+Description=OpenSSH server daemon (custom config)
+After=network.target
+
+[Service]
+Type=notify
+ExecStart=/usr/local/sbin/sshd -D -e -f /path/to/sshd_config
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=process
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Apply and manage:
+
+```
+sudo systemctl daemon-reload
+sudo systemctl enable --now sshd-custom.service
+sudo systemctl status sshd-custom.service
+sudo systemctl restart sshd-custom.service
+```
+
 ### Build-time Customisation
 
 There are many build-time customisation options available. All Autoconf destination path flags (e.g. ``--prefix``) are supported (and are usually required if you want to install OpenSSH).

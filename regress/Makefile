@@ -70,6 +70,7 @@ LTESTS= 	connect \
 		sftp-uri \
 		reconfigure \
 		dynamic-forward \
+		forward-http-proxy \
 		forwarding \
 		multiplex \
 		reexec \

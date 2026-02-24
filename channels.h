@@ -367,6 +367,9 @@ void	 channel_disable_admin(struct ssh *, int);
 void	 channel_update_permission(struct ssh *, int, int);
 Channel	*channel_connect_to_port(struct ssh *, const char *, u_short,
 	    char *, char *, int *, const char **);
+Channel	*channel_connect_to_port_via_proxy(struct ssh *,
+	    const char *, u_short, const char *, char *, char *, int *,
+	    const char **);
 Channel *channel_connect_to_path(struct ssh *, const char *, char *, char *);
 Channel	*channel_connect_stdio_fwd(struct ssh *, const char*,
 	    int, int, int, int);

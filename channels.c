@@ -72,11 +72,13 @@
 #include "packet.h"
 #include "log.h"
 #include "misc.h"
+#include "atomicio.h"
 #include "channels.h"
 #include "compat.h"
 #include "canohost.h"
 #include "pathnames.h"
 #include "match.h"
+#include "openbsd-compat/base64.h"
 
 /* XXX remove once we're satisfied there's no lurking bugs */
 /* #define DEBUG_CHANNEL_POLL 1 */
@@ -218,6 +220,23 @@ static int connect_next(struct channel_connect *);
 static void channel_connect_ctx_free(struct channel_connect *);
 static Channel *rdynamic_connect_prepare(struct ssh *, char *, char *);
 static int rdynamic_connect_finish(struct ssh *, Channel *);
+static int channel_check_port_open_permission(struct ssh *, const char *,
+	u_short, int *);
+static int parse_http_proxy_spec(const char *, char **, int *, char **, char **);
+static int parse_proxy_type(const char *, const char **, int *);
+static int proxy_socks4_connect(struct ssh *, const char *, const char *,
+	u_short, int *, const char **);
+static int proxy_socks5_connect(struct ssh *, const char *, const char *,
+	u_short, int *, const char **);
+static int proxy_connect_readline(int, char *, size_t);
+static int proxy_http_connect(struct ssh *, const char *, const char *,
+	u_short, int *, const char **);
+static int proxy_connect(struct ssh *, const char *, const char *,
+	u_short, int *, const char **);
+
+#define FWD_PROXY_HTTP		1
+#define FWD_PROXY_SOCKS4	2
+#define FWD_PROXY_SOCKS5	3
 
 /* Setup helper */
 static void channel_handler_init(struct ssh_channels *sc);
@@ -4872,17 +4891,13 @@ channel_connect_by_listen_path(struct ssh *ssh, const char *path,
 	return NULL;
 }
 
-/* Check if connecting to that port is permitted and connect. */
-Channel *
-channel_connect_to_port(struct ssh *ssh, const char *host, u_short port,
-    char *ctype, char *rname, int *reason, const char **errmsg)
+static int
+channel_check_port_open_permission(struct ssh *ssh, const char *host,
+    u_short port, int *reason)
 {
 	struct ssh_channels *sc = ssh->chanctxt;
 	struct permission_set *pset = &sc->local_perms;
-	struct channel_connect cctx;
-	Channel *c;
 	u_int i, permit, permit_adm = 1;
-	int sock;
 	struct permission *perm;
 
 	permit = pset->all_permitted;
@@ -4913,8 +4928,651 @@ channel_connect_to_port(struct ssh *ssh, const char *host, u_short port,
 		    ssh_remote_ipaddr(ssh), ssh_remote_port(ssh), host, port);
 		if (reason != NULL)
 			*reason = SSH2_OPEN_ADMINISTRATIVELY_PROHIBITED;
-		return NULL;
+		return 0;
 	}
+	return 1;
+}
+
+static int
+parse_http_proxy_spec(const char *spec, char **proxy_host, int *proxy_port,
+    char **proxy_user, char **proxy_pass)
+{
+	char *cp = NULL, *hostpart = NULL, *at, *portstr, *userinfo = NULL;
+	char *colon, *end;
+	int port;
+	size_t len;
+
+	*proxy_host = *proxy_user = *proxy_pass = NULL;
+	*proxy_port = 0;
+
+	if (spec == NULL || *spec == '\0')
+		return -1;
+	cp = xstrdup(spec);
+	hostpart = cp;
+	if ((at = strrchr(cp, '@')) != NULL) {
+		*at = '\0';
+		userinfo = cp;
+		hostpart = at + 1;
+	}
+
+	if (*hostpart == '[') {
+		if ((end = strchr(hostpart + 1, ']')) == NULL || end[1] != ':')
+			goto fail;
+		len = (size_t)(end - (hostpart + 1));
+		*proxy_host = xmalloc(len + 1);
+		memcpy(*proxy_host, hostpart + 1, len);
+		(*proxy_host)[len] = '\0';
+		portstr = end + 2;
+	} else {
+		if ((colon = strrchr(hostpart, ':')) == NULL)
+			goto fail;
+		*colon = '\0';
+		if (*hostpart == '\0')
+			goto fail;
+		*proxy_host = xstrdup(hostpart);
+		portstr = colon + 1;
+	}
+
+	if ((port = a2port(portstr)) <= 0)
+		goto fail;
+	*proxy_port = port;
+
+	if (userinfo != NULL) {
+		if ((colon = strchr(userinfo, ':')) == NULL)
+			goto fail;
+		*colon = '\0';
+		*proxy_user = xstrdup(userinfo);
+		*proxy_pass = xstrdup(colon + 1);
+	}
+	free(cp);
+	return 0;
+
+ fail:
+	free(cp);
+	free(*proxy_host);
+	*proxy_host = NULL;
+	free(*proxy_user);
+	*proxy_user = NULL;
+	free(*proxy_pass);
+	*proxy_pass = NULL;
+	*proxy_port = 0;
+	return -1;
+}
+
+static int
+parse_proxy_type(const char *proxy_spec, const char **proxy_target, int *ptype)
+{
+	if (proxy_spec == NULL || *proxy_spec == '\0')
+		return -1;
+	if (strncasecmp(proxy_spec, "http://", 7) == 0) {
+		*ptype = FWD_PROXY_HTTP;
+		*proxy_target = proxy_spec + 7;
+	} else if (strncasecmp(proxy_spec, "socks4://", 9) == 0) {
+		*ptype = FWD_PROXY_SOCKS4;
+		*proxy_target = proxy_spec + 9;
+	} else if (strncasecmp(proxy_spec, "socks5://", 9) == 0) {
+		*ptype = FWD_PROXY_SOCKS5;
+		*proxy_target = proxy_spec + 9;
+	} else {
+		*ptype = FWD_PROXY_HTTP;
+		*proxy_target = proxy_spec;
+	}
+	if (**proxy_target == '\0')
+		return -1;
+	return 0;
+}
+
+static int
+proxy_connect_readline(int fd, char *buf, size_t buflen)
+{
+	size_t i;
+
+	for (i = 0; i + 1 < buflen; i++) {
+		if (atomicio(read, fd, buf + i, 1) != 1)
+			return -1;
+		if (buf[i] == '\n') {
+			buf[i + 1] = '\0';
+			return 0;
+		}
+	}
+	return -1;
+}
+
+static int
+proxy_http_connect(struct ssh *ssh, const char *proxy_spec,
+    const char *target_host, u_short target_port,
+    int *reason, const char **errmsg)
+{
+	struct channel_connect cctx;
+	char *proxy_host = NULL, *proxy_user = NULL, *proxy_pass = NULL;
+	char *proxy_auth_plain = NULL, *proxy_auth_b64 = NULL;
+	char req[4096], hostport[1024], line[2048], ch;
+	int proxy_port = 0, status = 0, sock = -1, r;
+	size_t n, authsz;
+
+	memset(&cctx, 0, sizeof(cctx));
+
+	if (parse_http_proxy_spec(proxy_spec, &proxy_host, &proxy_port,
+	    &proxy_user, &proxy_pass) != 0) {
+		if (reason != NULL)
+			*reason = SSH2_OPEN_CONNECT_FAILED;
+		if (errmsg != NULL)
+			*errmsg = "invalid ForwardProxy";
+		goto out;
+	}
+	if (strpbrk(target_host, "\r\n\t ") != NULL) {
+		if (reason != NULL)
+			*reason = SSH2_OPEN_CONNECT_FAILED;
+		if (errmsg != NULL)
+			*errmsg = "invalid direct-tcpip target";
+		goto out;
+	}
+
+	sock = connect_to_helper(ssh, proxy_host, proxy_port, SOCK_STREAM,
+	    "direct-tcpip", "direct-tcpip", &cctx, reason, errmsg);
+	if (sock == -1)
+		goto out;
+
+	if (unset_nonblock(sock) == -1) {
+		if (reason != NULL)
+			*reason = SSH2_OPEN_CONNECT_FAILED;
+		if (errmsg != NULL)
+			*errmsg = "cannot set proxy socket blocking mode";
+		goto out;
+	}
+
+	if (strchr(target_host, ':') != NULL)
+		snprintf(hostport, sizeof(hostport), "[%s]:%u",
+		    target_host, target_port);
+	else
+		snprintf(hostport, sizeof(hostport), "%s:%u",
+		    target_host, target_port);
+
+	if (proxy_user != NULL) {
+		xasprintf(&proxy_auth_plain, "%s:%s", proxy_user,
+		    proxy_pass == NULL ? "" : proxy_pass);
+		authsz = (strlen(proxy_auth_plain) * 4) / 3 + 8;
+		proxy_auth_b64 = xmalloc(authsz);
+		if (b64_ntop((u_char *)proxy_auth_plain,
+		    strlen(proxy_auth_plain), proxy_auth_b64, authsz) == -1) {
+			if (reason != NULL)
+				*reason = SSH2_OPEN_CONNECT_FAILED;
+			if (errmsg != NULL)
+				*errmsg = "http proxy auth encoding failed";
+			goto out;
+		}
+		r = snprintf(req, sizeof(req),
+		    "CONNECT %s HTTP/1.1\r\n"
+		    "Host: %s\r\n"
+		    "Proxy-Authorization: Basic %s\r\n"
+		    "\r\n",
+		    hostport, hostport, proxy_auth_b64);
+	} else {
+		r = snprintf(req, sizeof(req),
+		    "CONNECT %s HTTP/1.1\r\n"
+		    "Host: %s\r\n"
+		    "\r\n",
+		    hostport, hostport);
+	}
+	if (r < 0 || (size_t)r >= sizeof(req)) {
+		if (reason != NULL)
+			*reason = SSH2_OPEN_CONNECT_FAILED;
+		if (errmsg != NULL)
+			*errmsg = "http proxy request too large";
+		goto out;
+	}
+
+	n = atomicio(vwrite, sock, req, (size_t)r);
+	if (n != (size_t)r) {
+		if (reason != NULL)
+			*reason = SSH2_OPEN_CONNECT_FAILED;
+		if (errmsg != NULL)
+			*errmsg = "http proxy write failed";
+		goto out;
+	}
+
+	if (proxy_connect_readline(sock, line, sizeof(line)) == -1 ||
+	    strncmp(line, "HTTP/1.", 7) != 0 ||
+	    sscanf(line, "HTTP/1.%c %d", &ch, &status) != 2 || status != 200) {
+		if (reason != NULL)
+			*reason = SSH2_OPEN_CONNECT_FAILED;
+		if (errmsg != NULL)
+			*errmsg = "http proxy CONNECT failed";
+		goto out;
+	}
+
+	for (;;) {
+		if (proxy_connect_readline(sock, line, sizeof(line)) == -1) {
+			if (reason != NULL)
+				*reason = SSH2_OPEN_CONNECT_FAILED;
+			if (errmsg != NULL)
+				*errmsg = "http proxy response parse failed";
+			goto out;
+		}
+		if (strcmp(line, "\n") == 0 || strcmp(line, "\r\n") == 0)
+			break;
+	}
+
+	if (set_nonblock(sock) == -1) {
+		if (reason != NULL)
+			*reason = SSH2_OPEN_CONNECT_FAILED;
+		if (errmsg != NULL)
+			*errmsg = "cannot set proxy socket non-blocking mode";
+		goto out;
+	}
+	channel_connect_ctx_free(&cctx);
+	free(proxy_host);
+	free(proxy_user);
+	free(proxy_pass);
+	free(proxy_auth_plain);
+	free(proxy_auth_b64);
+	return sock;
+
+ out:
+	if (sock != -1)
+		close(sock);
+	channel_connect_ctx_free(&cctx);
+	free(proxy_host);
+	free(proxy_user);
+	free(proxy_pass);
+	free(proxy_auth_plain);
+	free(proxy_auth_b64);
+	return -1;
+}
+
+static int
+proxy_socks4_connect(struct ssh *ssh, const char *proxy_spec,
+    const char *target_host, u_short target_port,
+    int *reason, const char **errmsg)
+{
+	struct channel_connect cctx;
+	struct sshbuf *req = NULL;
+	char *proxy_host = NULL, *proxy_user = NULL, *proxy_pass = NULL;
+	u_char rep[8], addr[4] = { 0, 0, 0, 1 };
+	int proxy_port = 0, sock = -1, r, socks4a = 0;
+	size_t n;
+
+	memset(&cctx, 0, sizeof(cctx));
+
+	if (parse_http_proxy_spec(proxy_spec, &proxy_host, &proxy_port,
+	    &proxy_user, &proxy_pass) != 0) {
+		if (reason != NULL)
+			*reason = SSH2_OPEN_CONNECT_FAILED;
+		if (errmsg != NULL)
+			*errmsg = "invalid ForwardProxy";
+		goto out;
+	}
+	if (strpbrk(target_host, "\r\n\t ") != NULL) {
+		if (reason != NULL)
+			*reason = SSH2_OPEN_CONNECT_FAILED;
+		if (errmsg != NULL)
+			*errmsg = "invalid direct-tcpip target";
+		goto out;
+	}
+	if (proxy_pass != NULL && *proxy_pass != '\0') {
+		if (reason != NULL)
+			*reason = SSH2_OPEN_CONNECT_FAILED;
+		if (errmsg != NULL)
+			*errmsg = "SOCKS4 does not support password auth";
+		goto out;
+	}
+
+	sock = connect_to_helper(ssh, proxy_host, proxy_port, SOCK_STREAM,
+	    "direct-tcpip", "direct-tcpip", &cctx, reason, errmsg);
+	if (sock == -1)
+		goto out;
+
+	if (unset_nonblock(sock) == -1) {
+		if (reason != NULL)
+			*reason = SSH2_OPEN_CONNECT_FAILED;
+		if (errmsg != NULL)
+			*errmsg = "cannot set proxy socket blocking mode";
+		goto out;
+	}
+
+	if ((req = sshbuf_new()) == NULL)
+		fatal_f("sshbuf_new failed");
+	if ((r = sshbuf_put_u8(req, 4)) != 0 ||
+	    (r = sshbuf_put_u8(req, 1)) != 0 ||
+	    (r = sshbuf_put_u16(req, target_port)) != 0)
+		fatal_fr(r, "compose socks4 request header");
+
+	if (inet_pton(AF_INET, target_host, addr) != 1)
+		socks4a = 1;
+	if ((r = sshbuf_put(req, addr, sizeof(addr))) != 0)
+		fatal_fr(r, "compose socks4 target addr");
+	if ((r = sshbuf_put_cstring(req, proxy_user == NULL ? "" : proxy_user)) != 0)
+		fatal_fr(r, "compose socks4 user");
+	if (socks4a) {
+		if ((r = sshbuf_put_cstring(req, target_host)) != 0)
+			fatal_fr(r, "compose socks4a target");
+	}
+
+	n = atomicio(vwrite, sock, sshbuf_mutable_ptr(req), sshbuf_len(req));
+	if (n != sshbuf_len(req)) {
+		if (reason != NULL)
+			*reason = SSH2_OPEN_CONNECT_FAILED;
+		if (errmsg != NULL)
+			*errmsg = "socks4 proxy write failed";
+		goto out;
+	}
+
+	if (atomicio(read, sock, rep, sizeof(rep)) != sizeof(rep) ||
+	    rep[0] != 0x00 || rep[1] != 0x5a) {
+		if (reason != NULL)
+			*reason = SSH2_OPEN_CONNECT_FAILED;
+		if (errmsg != NULL)
+			*errmsg = "socks4 proxy CONNECT failed";
+		goto out;
+	}
+
+	if (set_nonblock(sock) == -1) {
+		if (reason != NULL)
+			*reason = SSH2_OPEN_CONNECT_FAILED;
+		if (errmsg != NULL)
+			*errmsg = "cannot set proxy socket non-blocking mode";
+		goto out;
+	}
+
+	sshbuf_free(req);
+	channel_connect_ctx_free(&cctx);
+	free(proxy_host);
+	free(proxy_user);
+	free(proxy_pass);
+	return sock;
+
+ out:
+	if (sock != -1)
+		close(sock);
+	sshbuf_free(req);
+	channel_connect_ctx_free(&cctx);
+	free(proxy_host);
+	free(proxy_user);
+	free(proxy_pass);
+	return -1;
+}
+
+static int
+proxy_socks5_connect(struct ssh *ssh, const char *proxy_spec,
+    const char *target_host, u_short target_port,
+    int *reason, const char **errmsg)
+{
+	struct channel_connect cctx;
+	struct sshbuf *req = NULL;
+	char *proxy_host = NULL, *proxy_user = NULL, *proxy_pass = NULL;
+	u_char hdr[4], rep[2], addr[256];
+	int proxy_port = 0, sock = -1, r;
+	size_t n, alen;
+
+	memset(&cctx, 0, sizeof(cctx));
+
+	if (parse_http_proxy_spec(proxy_spec, &proxy_host, &proxy_port,
+	    &proxy_user, &proxy_pass) != 0) {
+		if (reason != NULL)
+			*reason = SSH2_OPEN_CONNECT_FAILED;
+		if (errmsg != NULL)
+			*errmsg = "invalid ForwardProxy";
+		goto out;
+	}
+	if (strpbrk(target_host, "\r\n\t ") != NULL) {
+		if (reason != NULL)
+			*reason = SSH2_OPEN_CONNECT_FAILED;
+		if (errmsg != NULL)
+			*errmsg = "invalid direct-tcpip target";
+		goto out;
+	}
+	if (proxy_user != NULL && strlen(proxy_user) > 255) {
+		if (reason != NULL)
+			*reason = SSH2_OPEN_CONNECT_FAILED;
+		if (errmsg != NULL)
+			*errmsg = "socks5 username too long";
+		goto out;
+	}
+	if (proxy_pass != NULL && strlen(proxy_pass) > 255) {
+		if (reason != NULL)
+			*reason = SSH2_OPEN_CONNECT_FAILED;
+		if (errmsg != NULL)
+			*errmsg = "socks5 password too long";
+		goto out;
+	}
+
+	sock = connect_to_helper(ssh, proxy_host, proxy_port, SOCK_STREAM,
+	    "direct-tcpip", "direct-tcpip", &cctx, reason, errmsg);
+	if (sock == -1)
+		goto out;
+
+	if (unset_nonblock(sock) == -1) {
+		if (reason != NULL)
+			*reason = SSH2_OPEN_CONNECT_FAILED;
+		if (errmsg != NULL)
+			*errmsg = "cannot set proxy socket blocking mode";
+		goto out;
+	}
+
+	if (proxy_user != NULL) {
+		hdr[0] = 0x05;
+		hdr[1] = 0x02;
+		hdr[2] = 0x00;
+		hdr[3] = 0x02;
+		n = atomicio(vwrite, sock, hdr, sizeof(hdr));
+	} else {
+		hdr[0] = 0x05;
+		hdr[1] = 0x01;
+		hdr[2] = 0x00;
+		n = atomicio(vwrite, sock, hdr, 3);
+	}
+	if ((proxy_user != NULL && n != sizeof(hdr)) ||
+	    (proxy_user == NULL && n != 3)) {
+		if (reason != NULL)
+			*reason = SSH2_OPEN_CONNECT_FAILED;
+		if (errmsg != NULL)
+			*errmsg = "socks5 proxy write failed";
+		goto out;
+	}
+
+	if (atomicio(read, sock, rep, sizeof(rep)) != sizeof(rep) ||
+	    rep[0] != 0x05 || rep[1] == 0xff) {
+		if (reason != NULL)
+			*reason = SSH2_OPEN_CONNECT_FAILED;
+		if (errmsg != NULL)
+			*errmsg = "socks5 auth method negotiation failed";
+		goto out;
+	}
+
+	if (rep[1] == 0x02) {
+		u_char authhdr[2], authrep[2], ulen, plen;
+
+		if (proxy_user == NULL || *proxy_user == '\0') {
+			if (reason != NULL)
+				*reason = SSH2_OPEN_CONNECT_FAILED;
+			if (errmsg != NULL)
+				*errmsg = "socks5 proxy requires username/password";
+			goto out;
+		}
+		authhdr[0] = 0x01;
+		ulen = (u_char)strlen(proxy_user);
+		plen = (u_char)strlen(proxy_pass == NULL ? "" : proxy_pass);
+		authhdr[1] = ulen;
+		if (atomicio(vwrite, sock, authhdr, sizeof(authhdr)) != sizeof(authhdr) ||
+		    atomicio(vwrite, sock, proxy_user, ulen) != ulen ||
+		    atomicio(vwrite, sock, &plen, 1) != 1 ||
+		    atomicio(vwrite, sock, proxy_pass == NULL ? "" : proxy_pass, plen) != plen ||
+		    atomicio(read, sock, authrep, sizeof(authrep)) != sizeof(authrep) ||
+		    authrep[0] != 0x01 || authrep[1] != 0x00) {
+			if (reason != NULL)
+				*reason = SSH2_OPEN_CONNECT_FAILED;
+			if (errmsg != NULL)
+				*errmsg = "socks5 username/password auth failed";
+			goto out;
+		}
+	} else if (rep[1] != 0x00) {
+		if (reason != NULL)
+			*reason = SSH2_OPEN_CONNECT_FAILED;
+		if (errmsg != NULL)
+			*errmsg = "socks5 unsupported auth method";
+		goto out;
+	}
+
+	if ((req = sshbuf_new()) == NULL)
+		fatal_f("sshbuf_new failed");
+	if ((r = sshbuf_put_u8(req, 0x05)) != 0 ||
+	    (r = sshbuf_put_u8(req, 0x01)) != 0 ||
+	    (r = sshbuf_put_u8(req, 0x00)) != 0)
+		fatal_fr(r, "compose socks5 request header");
+
+	if (inet_pton(AF_INET, target_host, addr) == 1) {
+		if ((r = sshbuf_put_u8(req, 0x01)) != 0 ||
+		    (r = sshbuf_put(req, addr, 4)) != 0)
+			fatal_fr(r, "compose socks5 ipv4");
+	} else if (inet_pton(AF_INET6, target_host, addr) == 1) {
+		if ((r = sshbuf_put_u8(req, 0x04)) != 0 ||
+		    (r = sshbuf_put(req, addr, 16)) != 0)
+			fatal_fr(r, "compose socks5 ipv6");
+	} else {
+		if (strlen(target_host) > 255) {
+			if (reason != NULL)
+				*reason = SSH2_OPEN_CONNECT_FAILED;
+			if (errmsg != NULL)
+				*errmsg = "socks5 target hostname too long";
+			goto out;
+		}
+		if ((r = sshbuf_put_u8(req, 0x03)) != 0 ||
+		    (r = sshbuf_put_u8(req, (u_char)strlen(target_host))) != 0 ||
+		    (r = sshbuf_put(req, target_host, strlen(target_host))) != 0)
+			fatal_fr(r, "compose socks5 hostname");
+	}
+	if ((r = sshbuf_put_u16(req, target_port)) != 0)
+		fatal_fr(r, "compose socks5 port");
+
+	n = atomicio(vwrite, sock, sshbuf_mutable_ptr(req), sshbuf_len(req));
+	if (n != sshbuf_len(req)) {
+		if (reason != NULL)
+			*reason = SSH2_OPEN_CONNECT_FAILED;
+		if (errmsg != NULL)
+			*errmsg = "socks5 proxy write failed";
+		goto out;
+	}
+
+	if (atomicio(read, sock, hdr, sizeof(hdr)) != sizeof(hdr) ||
+	    hdr[0] != 0x05 || hdr[1] != 0x00 || hdr[2] != 0x00) {
+		if (reason != NULL)
+			*reason = SSH2_OPEN_CONNECT_FAILED;
+		if (errmsg != NULL)
+			*errmsg = "socks5 proxy CONNECT failed";
+		goto out;
+	}
+
+	switch (hdr[3]) {
+	case 0x01:
+		alen = 4;
+		break;
+	case 0x03:
+		if (atomicio(read, sock, &hdr[0], 1) != 1) {
+			if (reason != NULL)
+				*reason = SSH2_OPEN_CONNECT_FAILED;
+			if (errmsg != NULL)
+				*errmsg = "socks5 response parse failed";
+			goto out;
+		}
+		alen = hdr[0];
+		break;
+	case 0x04:
+		alen = 16;
+		break;
+	default:
+		if (reason != NULL)
+			*reason = SSH2_OPEN_CONNECT_FAILED;
+		if (errmsg != NULL)
+			*errmsg = "socks5 response has invalid address type";
+		goto out;
+	}
+	if (alen > 0 && atomicio(read, sock, addr, alen) != alen) {
+		if (reason != NULL)
+			*reason = SSH2_OPEN_CONNECT_FAILED;
+		if (errmsg != NULL)
+			*errmsg = "socks5 response parse failed";
+		goto out;
+	}
+	if (atomicio(read, sock, addr, 2) != 2) {
+		if (reason != NULL)
+			*reason = SSH2_OPEN_CONNECT_FAILED;
+		if (errmsg != NULL)
+			*errmsg = "socks5 response parse failed";
+		goto out;
+	}
+
+	if (set_nonblock(sock) == -1) {
+		if (reason != NULL)
+			*reason = SSH2_OPEN_CONNECT_FAILED;
+		if (errmsg != NULL)
+			*errmsg = "cannot set proxy socket non-blocking mode";
+		goto out;
+	}
+
+	sshbuf_free(req);
+	channel_connect_ctx_free(&cctx);
+	free(proxy_host);
+	free(proxy_user);
+	free(proxy_pass);
+	return sock;
+
+ out:
+	if (sock != -1)
+		close(sock);
+	sshbuf_free(req);
+	channel_connect_ctx_free(&cctx);
+	free(proxy_host);
+	free(proxy_user);
+	free(proxy_pass);
+	return -1;
+}
+
+static int
+proxy_connect(struct ssh *ssh, const char *proxy_spec,
+    const char *target_host, u_short target_port,
+    int *reason, const char **errmsg)
+{
+	const char *proxy_target = NULL;
+	int ptype;
+
+	if (parse_proxy_type(proxy_spec, &proxy_target, &ptype) != 0) {
+		if (reason != NULL)
+			*reason = SSH2_OPEN_CONNECT_FAILED;
+		if (errmsg != NULL)
+			*errmsg = "invalid ForwardProxy";
+		return -1;
+	}
+
+	switch (ptype) {
+	case FWD_PROXY_HTTP:
+		return proxy_http_connect(ssh, proxy_target,
+		    target_host, target_port, reason, errmsg);
+	case FWD_PROXY_SOCKS4:
+		return proxy_socks4_connect(ssh, proxy_target,
+		    target_host, target_port, reason, errmsg);
+	case FWD_PROXY_SOCKS5:
+		return proxy_socks5_connect(ssh, proxy_target,
+		    target_host, target_port, reason, errmsg);
+	default:
+		if (reason != NULL)
+			*reason = SSH2_OPEN_CONNECT_FAILED;
+		if (errmsg != NULL)
+			*errmsg = "unsupported ForwardProxy scheme";
+		return -1;
+	}
+}
+
+/* Check if connecting to that port is permitted and connect. */
+Channel *
+channel_connect_to_port(struct ssh *ssh, const char *host, u_short port,
+    char *ctype, char *rname, int *reason, const char **errmsg)
+{
+	struct channel_connect cctx;
+	Channel *c;
+	int sock;
+
+	if (!channel_check_port_open_permission(ssh, host, port, reason))
+		return NULL;
 
 	memset(&cctx, 0, sizeof(cctx));
 	sock = connect_to_helper(ssh, host, port, SOCK_STREAM, ctype, rname,
@@ -4923,6 +5581,35 @@ channel_connect_to_port(struct ssh *ssh, const char *host, u_short port,
 		channel_connect_ctx_free(&cctx);
 		return NULL;
 	}
+
+	c = channel_new(ssh, ctype, SSH_CHANNEL_CONNECTING, sock, sock, -1,
+	    CHAN_TCP_WINDOW_DEFAULT, CHAN_TCP_PACKET_DEFAULT, 0, rname, 1);
+	c->host_port = port;
+	c->path = xstrdup(host);
+	c->connect_ctx = cctx;
+
+	return c;
+}
+
+Channel *
+channel_connect_to_port_via_proxy(struct ssh *ssh, const char *host,
+    u_short port, const char *proxy_spec, char *ctype, char *rname,
+    int *reason, const char **errmsg)
+{
+	struct channel_connect cctx;
+	Channel *c;
+	int sock;
+
+	if (!channel_check_port_open_permission(ssh, host, port, reason))
+		return NULL;
+
+	sock = proxy_connect(ssh, proxy_spec, host, port, reason, errmsg);
+	if (sock == -1)
+		return NULL;
+
+	memset(&cctx, 0, sizeof(cctx));
+	cctx.host = xstrdup(host);
+	cctx.port = port;
 
 	c = channel_new(ssh, ctype, SSH_CHANNEL_CONNECTING, sock, sock, -1,
 	    CHAN_TCP_WINDOW_DEFAULT, CHAN_TCP_PACKET_DEFAULT, 0, rname, 1);

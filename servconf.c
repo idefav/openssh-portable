@@ -145,6 +145,7 @@ initialize_server_options(ServerOptions *options)
 	options->allow_tcp_forwarding = -1;
 	options->allow_streamlocal_forwarding = -1;
 	options->allow_agent_forwarding = -1;
+	options->forward_http_proxy = NULL;
 	options->num_allow_users = 0;
 	options->num_deny_users = 0;
 	options->num_allow_groups = 0;
@@ -524,6 +525,7 @@ fill_default_server_options(ServerOptions *options)
 	CLEAR_ON_NONE(options->adm_forced_command);
 	CLEAR_ON_NONE(options->chroot_directory);
 	CLEAR_ON_NONE(options->routing_domain);
+	CLEAR_ON_NONE(options->forward_http_proxy);
 	CLEAR_ON_NONE(options->host_key_agent);
 	CLEAR_ON_NONE(options->per_source_penalty_exempt);
 
@@ -555,6 +557,7 @@ typedef enum {
 	sX11Forwarding, sX11DisplayOffset, sX11UseLocalhost,
 	sPermitTTY, sStrictModes, sEmptyPasswd, sTCPKeepAlive,
 	sPermitUserEnvironment, sAllowTcpForwarding, sCompression,
+	sForwardHttpProxy, sForwardProxy,
 	sRekeyLimit, sAllowUsers, sDenyUsers, sAllowGroups, sDenyGroups,
 	sIgnoreUserKnownHosts, sCiphers, sMacs, sPidFile, sModuliFile,
 	sGatewayPorts, sPubkeyAuthentication, sPubkeyAcceptedAlgorithms,
@@ -686,6 +689,8 @@ static struct {
 	{ "tcpkeepalive", sTCPKeepAlive, SSHCFG_GLOBAL },
 	{ "keepalive", sTCPKeepAlive, SSHCFG_GLOBAL },	/* obsolete alias */
 	{ "allowtcpforwarding", sAllowTcpForwarding, SSHCFG_ALL },
+	{ "forwardproxy", sForwardProxy, SSHCFG_ALL },
+	{ "forwardhttpproxy", sForwardHttpProxy, SSHCFG_ALL },
 	{ "allowagentforwarding", sAllowAgentForwarding, SSHCFG_ALL },
 	{ "allowusers", sAllowUsers, SSHCFG_ALL },
 	{ "denyusers", sDenyUsers, SSHCFG_ALL },
@@ -1856,6 +1861,17 @@ process_server_config_line_depth(ServerOptions *options, char *line,
 	case sAllowAgentForwarding:
 		intptr = &options->allow_agent_forwarding;
 		goto parse_flag;
+
+	case sForwardProxy:
+	case sForwardHttpProxy:
+		charptr = &options->forward_http_proxy;
+		arg = argv_next(&ac, &av);
+		if (!arg || *arg == '\0')
+			fatal("%s line %d: missing argument.",
+			    filename, linenum);
+		if (*activep && *charptr == NULL)
+			*charptr = xstrdup(arg);
+		break;
 
 	case sDisableForwarding:
 		intptr = &options->disable_forwarding;
@@ -3311,6 +3327,7 @@ dump_config(ServerOptions *o)
 	dump_cfg_fmtint(sGatewayPorts, o->fwd_opts.gateway_ports);
 	dump_cfg_fmtint(sUseDNS, o->use_dns);
 	dump_cfg_fmtint(sAllowTcpForwarding, o->allow_tcp_forwarding);
+	dump_cfg_string(sForwardProxy, o->forward_http_proxy);
 	dump_cfg_fmtint(sAllowAgentForwarding, o->allow_agent_forwarding);
 	dump_cfg_fmtint(sDisableForwarding, o->disable_forwarding);
 	dump_cfg_fmtint(sAllowStreamLocalForwarding, o->allow_streamlocal_forwarding);
