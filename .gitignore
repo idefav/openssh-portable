@@ -36,6 +36,7 @@ sshd-auth
 !regress/misc/**/Makefile
 !regress/unittests/**/Makefile
 tags
+regress/
 
 # Ignored on main branch
 config.h.in
