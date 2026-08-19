@@ -97,7 +97,7 @@ binaries instead of any system-installed OpenSSH.
 If you prefer a compact one-liner, use:
 
 ```
-BIN="$PWD"; make -C regress t-exec .CURDIR="$PWD/regress" .OBJDIR="$PWD/regress" OBJ="$PWD/regress" TEST_SHELL=sh LTESTS='dynamic-forward forward-http-proxy' TEST_SSH_UNSAFE_PERMISSIONS=1 TEST_SSH_SSH="$BIN/ssh" TEST_SSH_SSHD="$BIN/sshd" TEST_SSH_SSHD_SESSION="$BIN/sshd-session" TEST_SSH_SSHD_AUTH="$BIN/sshd-auth" TEST_SSH_SSHAGENT="$BIN/ssh-agent" TEST_SSH_SSHADD="$BIN/ssh-add" TEST_SSH_SSHKEYGEN="$BIN/ssh-keygen" TEST_SSH_SSHKEYSCAN="$BIN/ssh-keyscan" TEST_SSH_SFTP="$BIN/sftp" TEST_SSH_SFTPSERVER="$BIN/sftp-server" TEST_SSH_SCP="$BIN/scp"
+BIN="$PWD"; make -C regress t-exec .CURDIR="$PWD/regress" .OBJDIR="$PWD/regress" OBJ="$PWD/regress" TEST_SHELL=sh LTESTS='dynamic-forward forward-http-proxy ssh-relay' TEST_SSH_UNSAFE_PERMISSIONS=1 TEST_SSH_SSH="$BIN/ssh" TEST_SSH_SSHD="$BIN/sshd" TEST_SSH_SSHD_SESSION="$BIN/sshd-session" TEST_SSH_SSHD_AUTH="$BIN/sshd-auth" TEST_SSH_SSHAGENT="$BIN/ssh-agent" TEST_SSH_SSHADD="$BIN/ssh-add" TEST_SSH_SSHKEYGEN="$BIN/ssh-keygen" TEST_SSH_SSHKEYSCAN="$BIN/ssh-keyscan" TEST_SSH_SFTP="$BIN/sftp" TEST_SSH_SFTPSERVER="$BIN/sftp-server" TEST_SSH_SCP="$BIN/scp"
 ```
 
 To run only the ``forward-http-proxy`` test:
@@ -186,19 +186,36 @@ configured HTTP or SOCKS proxy.
 ### Transparent SSH relay
 
 A dedicated ``sshd`` instance may relay its complete incoming TCP stream to a
-fixed second SSH server before any SSH handshake takes place:
+fixed second SSH server before any SSH handshake takes place.  For example,
+create ``/etc/ssh/sshd_relay_config`` on relay host A:
 
 ```
 Port 11111
+ListenAddress 0.0.0.0
 PidFile /run/sshd-relay.pid
-SSHRelayTarget [2001:db8::b]:22
+SSHRelayTarget B.example.com:22
 SSHRelayConnectTimeout 10s
+```
+
+Validate and start the dedicated relay instance:
+
+```
+sudo /usr/local/sbin/sshd -t -f /etc/ssh/sshd_relay_config
+sudo /usr/local/sbin/sshd -f /etc/ssh/sshd_relay_config
+```
+
+Connect to A using the username and authentication method accepted by B:
+
+```
+ssh -p 11111 idefav@A.example.com
 ```
 
 The client connects to the relay address but sees the target server's host key
 and authenticates directly to the target.  The relay never receives or
 replays the SSH username, password, private-key signature or channel data.
-Use another ``sshd`` instance for administrative access to the relay host.
+Host-key checking must therefore associate this endpoint with B's host key.
+Use another ``sshd`` instance and port for administrative access to relay host
+A; every connection accepted by the relay instance is forwarded to B.
 
 On the target server, ``ForwardProxy`` may then proxy ``direct-tcpip`` traffic
 created by ``ssh -D`` or ``ssh -L``:
@@ -210,6 +227,12 @@ ForwardProxy socks5://proxyuser:proxypass@127.0.0.1:1080
 
 Ordinary shell, exec, SCP and SFTP traffic terminates at the target SSH server;
 only forwarding channels are sent through ``ForwardProxy``.
+
+Relay instances may be chained.  In an A to B to C chain, configure A with
+``SSHRelayTarget B.example.com:11111`` and configure B's relay instance with
+``SSHRelayTarget C.example.com:22``.  The client still performs a single SSH
+handshake and authenticates only to C.  Configure ``ForwardProxy`` on C if C
+is the server that terminates SSH and handles forwarding channels.
 
 Running ``sshd`` with a specific config file:
 
@@ -285,6 +308,20 @@ ForwardProxy none
 #
 # Legacy alias (kept for compatibility, maps to ForwardProxy):
 #   ForwardHttpProxy 127.0.0.1:3081
+
+# Transparent SSH relay (dedicated sshd instance only)
+# Default disabled:
+SSHRelayTarget none
+# Maximum total time to connect to the next relay/target:
+SSHRelayConnectTimeout 10s
+#
+# Enable with an explicit target port:
+#   SSHRelayTarget B.example.com:22
+#   SSHRelayTarget [2001:db8::b]:22
+#
+# When enabled, this sshd does not authenticate users or terminate SSH.
+# Run it with a dedicated config/listen port and keep a separate normal sshd
+# instance for administrative access to this host.
 
 # Keepalive
 ClientAliveInterval 0
