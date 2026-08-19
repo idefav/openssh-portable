@@ -183,6 +183,34 @@ With ``ForwardProxy`` set, server handling of ``direct-tcpip`` channels
 (including traffic from ``-D`` dynamic forwarding) will egress through the
 configured HTTP or SOCKS proxy.
 
+### Transparent SSH relay
+
+A dedicated ``sshd`` instance may relay its complete incoming TCP stream to a
+fixed second SSH server before any SSH handshake takes place:
+
+```
+Port 11111
+PidFile /run/sshd-relay.pid
+SSHRelayTarget [2001:db8::b]:22
+SSHRelayConnectTimeout 10s
+```
+
+The client connects to the relay address but sees the target server's host key
+and authenticates directly to the target.  The relay never receives or
+replays the SSH username, password, private-key signature or channel data.
+Use another ``sshd`` instance for administrative access to the relay host.
+
+On the target server, ``ForwardProxy`` may then proxy ``direct-tcpip`` traffic
+created by ``ssh -D`` or ``ssh -L``:
+
+```
+AllowTcpForwarding yes
+ForwardProxy socks5://proxyuser:proxypass@127.0.0.1:1080
+```
+
+Ordinary shell, exec, SCP and SFTP traffic terminates at the target SSH server;
+only forwarding channels are sent through ``ForwardProxy``.
+
 Running ``sshd`` with a specific config file:
 
 ``sshd`` supports an explicit config path via ``-f``.

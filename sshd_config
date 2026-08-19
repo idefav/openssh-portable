@@ -89,6 +89,9 @@ AuthorizedKeysFile	.ssh/authorized_keys
 #ForwardProxy none
 # Legacy alias (default disabled)
 #ForwardHttpProxy none
+# Transparent pre-handshake relay for a dedicated sshd instance
+#SSHRelayTarget none
+#SSHRelayConnectTimeout 10s
 #GatewayPorts no
 #X11Forwarding no
 #X11DisplayOffset 10

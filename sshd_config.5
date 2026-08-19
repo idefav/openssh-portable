@@ -212,6 +212,37 @@ The legacy keyword
 .Cm ForwardHttpProxy
 is accepted as an alias for
 .Cm ForwardProxy .
+.It Cm SSHRelayTarget
+Specifies a fixed SSH server to which all connections accepted by this
+.Nm sshd
+instance are relayed as an unmodified TCP byte stream.
+The argument must be
+.Cm none
+or a hostname and explicit port in
+.Ar host : port
+form.
+IPv6 addresses must be enclosed in square brackets.
+.Pp
+Relay mode takes effect before the SSH identification and key exchange.
+Consequently, the target server supplies the host key and performs all user
+authentication and session handling; this server does not inspect usernames,
+passwords, keys, channels or session data.
+All listening addresses of the instance are relayed, so a separate
+.Nm sshd
+instance should be used for administrative access to the relay host.
+If the target cannot be reached then the connection is closed without falling
+back to local SSH handling.
+This option is not permitted in a
+.Cm Match
+block and is not supported in inetd mode.
+The default is
+.Cm none .
+.It Cm SSHRelayConnectTimeout
+Specifies the maximum total time allowed to establish a connection to the
+target configured by
+.Cm SSHRelayTarget .
+The value must be a positive time interval.
+The default is 10 seconds.
 .It Cm AuthenticationMethods
 Specifies the authentication methods that must be successfully completed
 for a user to be granted access.

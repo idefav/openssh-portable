@@ -166,6 +166,8 @@ typedef struct {
 	int	allow_streamlocal_forwarding; /* One of FORWARD_* */
 	int	allow_agent_forwarding;
 	char	*forward_http_proxy; /* optional upstream proxy for direct-tcpip */
+	char	*ssh_relay_target; /* optional transparent SSH relay target */
+	int	ssh_relay_connect_timeout;
 	int	disable_forwarding;
 	u_int num_allow_users;
 	char   **allow_users;

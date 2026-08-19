@@ -36,7 +36,8 @@ sshd-auth
 !regress/misc/**/Makefile
 !regress/unittests/**/Makefile
 tags
-regress/
+regress/*
+!regress/ssh-relay.sh
 
 # Ignored on main branch
 config.h.in

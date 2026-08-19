@@ -146,6 +146,8 @@ initialize_server_options(ServerOptions *options)
 	options->allow_streamlocal_forwarding = -1;
 	options->allow_agent_forwarding = -1;
 	options->forward_http_proxy = NULL;
+	options->ssh_relay_target = NULL;
+	options->ssh_relay_connect_timeout = -1;
 	options->num_allow_users = 0;
 	options->num_deny_users = 0;
 	options->num_allow_groups = 0;
@@ -406,6 +408,8 @@ fill_default_server_options(ServerOptions *options)
 		options->allow_streamlocal_forwarding = FORWARD_ALLOW;
 	if (options->allow_agent_forwarding == -1)
 		options->allow_agent_forwarding = 1;
+	if (options->ssh_relay_connect_timeout == -1)
+		options->ssh_relay_connect_timeout = 10;
 	if (options->fwd_opts.gateway_ports == -1)
 		options->fwd_opts.gateway_ports = 0;
 	if (options->max_startups == -1)
@@ -526,6 +530,7 @@ fill_default_server_options(ServerOptions *options)
 	CLEAR_ON_NONE(options->chroot_directory);
 	CLEAR_ON_NONE(options->routing_domain);
 	CLEAR_ON_NONE(options->forward_http_proxy);
+	CLEAR_ON_NONE(options->ssh_relay_target);
 	CLEAR_ON_NONE(options->host_key_agent);
 	CLEAR_ON_NONE(options->per_source_penalty_exempt);
 
@@ -557,7 +562,8 @@ typedef enum {
 	sX11Forwarding, sX11DisplayOffset, sX11UseLocalhost,
 	sPermitTTY, sStrictModes, sEmptyPasswd, sTCPKeepAlive,
 	sPermitUserEnvironment, sAllowTcpForwarding, sCompression,
-	sForwardHttpProxy, sForwardProxy,
+	sForwardHttpProxy, sForwardProxy, sSSHRelayTarget,
+	sSSHRelayConnectTimeout,
 	sRekeyLimit, sAllowUsers, sDenyUsers, sAllowGroups, sDenyGroups,
 	sIgnoreUserKnownHosts, sCiphers, sMacs, sPidFile, sModuliFile,
 	sGatewayPorts, sPubkeyAuthentication, sPubkeyAcceptedAlgorithms,
@@ -691,6 +697,8 @@ static struct {
 	{ "allowtcpforwarding", sAllowTcpForwarding, SSHCFG_ALL },
 	{ "forwardproxy", sForwardProxy, SSHCFG_ALL },
 	{ "forwardhttpproxy", sForwardHttpProxy, SSHCFG_ALL },
+	{ "sshrelaytarget", sSSHRelayTarget, SSHCFG_GLOBAL },
+	{ "sshrelayconnecttimeout", sSSHRelayConnectTimeout, SSHCFG_GLOBAL },
 	{ "allowagentforwarding", sAllowAgentForwarding, SSHCFG_ALL },
 	{ "allowusers", sAllowUsers, SSHCFG_ALL },
 	{ "denyusers", sDenyUsers, SSHCFG_ALL },
@@ -1871,6 +1879,38 @@ process_server_config_line_depth(ServerOptions *options, char *line,
 			    filename, linenum);
 		if (*activep && *charptr == NULL)
 			*charptr = xstrdup(arg);
+		break;
+
+	case sSSHRelayTarget: {
+		char *relay_user = NULL, *relay_host = NULL;
+		int relay_port = -1;
+
+		charptr = &options->ssh_relay_target;
+		arg = argv_next(&ac, &av);
+		if (!arg || *arg == '\0')
+			fatal("%s line %d: missing argument.", filename, linenum);
+		if (strcasecmp(arg, "none") != 0 &&
+		    (parse_user_host_port(arg, &relay_user, &relay_host,
+		    &relay_port) != 0 || relay_user != NULL || relay_port <= 0))
+			fatal("%s line %d: invalid SSHRelayTarget.",
+			    filename, linenum);
+		free(relay_user);
+		free(relay_host);
+		if (*activep && *charptr == NULL)
+			*charptr = xstrdup(arg);
+		break;
+	}
+
+	case sSSHRelayConnectTimeout:
+		intptr = &options->ssh_relay_connect_timeout;
+		arg = argv_next(&ac, &av);
+		if (!arg || *arg == '\0')
+			fatal("%s line %d: missing time value.", filename, linenum);
+		if ((value = convtime(arg)) <= 0)
+			fatal("%s line %d: invalid SSHRelayConnectTimeout.",
+			    filename, linenum);
+		if (*activep && *intptr == -1)
+			*intptr = value;
 		break;
 
 	case sDisableForwarding:
@@ -3286,6 +3326,7 @@ dump_config(ServerOptions *o)
 	dump_cfg_int(sRequiredRSASize, o->required_rsa_size);
 	dump_cfg_oct(sStreamLocalBindMask, o->fwd_opts.streamlocal_bind_mask);
 	dump_cfg_int(sUnusedConnectionTimeout, o->unused_connection_timeout);
+	dump_cfg_int(sSSHRelayConnectTimeout, o->ssh_relay_connect_timeout);
 
 	/* formatted integer arguments */
 	dump_cfg_fmtint(sPermitRootLogin, o->permit_root_login);
@@ -3328,6 +3369,7 @@ dump_config(ServerOptions *o)
 	dump_cfg_fmtint(sUseDNS, o->use_dns);
 	dump_cfg_fmtint(sAllowTcpForwarding, o->allow_tcp_forwarding);
 	dump_cfg_string(sForwardProxy, o->forward_http_proxy);
+	dump_cfg_string(sSSHRelayTarget, o->ssh_relay_target);
 	dump_cfg_fmtint(sAllowAgentForwarding, o->allow_agent_forwarding);
 	dump_cfg_fmtint(sDisableForwarding, o->disable_forwarding);
 	dump_cfg_fmtint(sAllowStreamLocalForwarding, o->allow_streamlocal_forwarding);

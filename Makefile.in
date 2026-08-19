@@ -117,6 +117,7 @@ SSHOBJS= ssh.o readconf.o clientloop.o sshtty.o \
 	sshconnect.o sshconnect2.o mux.o ssh-pkcs11.o $(SKOBJS)
 
 SSHDOBJS=sshd.o \
+	sshrelay.o uidswap.o \
 	platform-listen.o \
 	servconf.o sshpty.o srclimit.o groupaccess.o auth2-methods.o \
 	dns.o fatal.o compat.o utf8.o authfd.o canohost.o \

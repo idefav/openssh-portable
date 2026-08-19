@@ -71,6 +71,7 @@ LTESTS= 	connect \
 		reconfigure \
 		dynamic-forward \
 		forward-http-proxy \
+		ssh-relay \
 		forwarding \
 		multiplex \
 		reexec \
@@ -153,6 +154,8 @@ CLEANFILES=	*.core actual agent-key.* authorized_keys_${USERNAME} \
 		ssh_config ssh_config.* ssh_proxy ssh_proxy_bak \
 		ssh_proxy_* sshd.log sshd_config sshd_config.* \
 		sshd_config.* sshd_proxy sshd_proxy.* sshd_proxy_bak \
+		sshd_relay sshd_relay_match ssh_relay pidfile-relay relay.in \
+		relay.out sshd-relay.log \
 		sshd_proxy_orig t10.out t10.out.pub t12.out t12.out.pub \
 		t2.out t3.out t6.out1 t6.out2 t7.out t7.out.pub \
 		t8.out t8.out.pub t9.out t9.out.pub \

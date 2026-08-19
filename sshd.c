@@ -79,6 +79,8 @@
 #include "addr.h"
 #include "srclimit.h"
 #include "atomicio.h"
+#include "sshrelay.h"
+#include "uidswap.h"
 #ifdef GSSAPI
 #include "ssh-gss.h"
 #endif
@@ -88,6 +90,10 @@
 #define REEXEC_DEVCRYPTO_RESERVED_FD	(STDERR_FILENO + 1)
 #define REEXEC_CONFIG_PASS_FD		(STDERR_FILENO + 2)
 #define REEXEC_MIN_FREE_FD		(STDERR_FILENO + 3)
+
+#define CHILD_STATE_READY	'\0'
+#define CHILD_STATE_AUTHENTICATED '\001'
+#define CHILD_STATE_RELAY_ESTABLISHED '\002'
 
 extern char *__progname;
 
@@ -157,8 +163,9 @@ u_int utmp_len = HOST_NAME_MAX+1;
  * and (if applicable) received their rexec state by sending a char over their
  * sock.
  *
- * Child processes signal that authentication has completed by sending a
- * second char over the socket before closing it, otherwise the listener will
+ * Child processes signal that authentication has completed, or that a
+ * configured transparent relay has connected to its target, by sending a
+ * second char over the socket before closing it. Otherwise the listener will
  * continue tracking the child (and using up a MaxStartups slot) until the
  * preauth subprocess exits, whereupon the listener will log its exit status.
  * preauth processes will exit with a status of EXIT_LOGIN_GRACE to indicate
@@ -245,7 +252,8 @@ child_register(int pipefd, int sockfd)
 	}
 	child->pipefd = pipefd;
 	child->early = 1;
-	if ((child->config = sshbuf_fromb(config)) == NULL)
+	if (options.ssh_relay_target == NULL &&
+	    (child->config = sshbuf_fromb(config)) == NULL)
 		fatal_f("sshbuf_fromb failed");
 	/* record peer address, if available */
 	if (getpeername(sockfd, sa, &addrlen) == 0 &&
@@ -1088,18 +1096,25 @@ server_accept_loop(int *sock_in, int *sock_out, int *newsock, int *config_s,
 					    i, children[i].pipefd);
 					goto problem_child;
 				}
-				if (children[i].early && c == '\0') {
+				if (children[i].early && c == CHILD_STATE_READY) {
 					/* child has finished preliminaries */
 					listening--;
 					children[i].early = 0;
 					debug2_f("child %lu for %s received "
 					    "config", (long)children[i].pid,
 					    children[i].id);
-				} else if (!children[i].early && c == '\001') {
+				} else if (!children[i].early &&
+				    c == CHILD_STATE_AUTHENTICATED) {
 					/* child has completed auth */
 					debug2_f("child %lu for %s auth done",
 					    (long)children[i].pid,
 					    children[i].id);
+					child_close(&(children[i]), 1, 0);
+				} else if (!children[i].early &&
+				    c == CHILD_STATE_RELAY_ESTABLISHED &&
+				    options.ssh_relay_target != NULL) {
+					debug2_f("child %lu for %s relay established",
+					    (long)children[i].pid, children[i].id);
 					child_close(&(children[i]), 1, 0);
 				} else {
 					error_f("unexpected message 0x%02x "
@@ -1164,7 +1179,8 @@ server_accept_loop(int *sock_in, int *sock_out, int *newsock, int *config_s,
 				close_listen_socks();
 				*sock_in = *newsock;
 				*sock_out = *newsock;
-				send_rexec_state(config_s[0]);
+				if (options.ssh_relay_target == NULL)
+					send_rexec_state(config_s[0]);
 				close(config_s[0]);
 				free(pfd);
 				free(startup_pollfd);
@@ -1221,6 +1237,70 @@ server_accept_loop(int *sock_in, int *sock_out, int *newsock, int *config_s,
 			reseed_prngs();
 		}
 	}
+}
+
+static void
+run_ssh_relay(int client_fd, int status_fd)
+{
+	char *host = NULL, *remote = NULL, *local = NULL;
+	int port = -1, upstream = -1, on = 1, r;
+	uint64_t client_bytes = 0, upstream_bytes = 0;
+
+	if (status_fd != -1)
+		(void)atomicio(vwrite, status_fd, "\0", 1);
+	ssh_signal(SIGALRM, SIG_DFL);
+	ssh_signal(SIGHUP, SIG_DFL);
+	ssh_signal(SIGTERM, SIG_DFL);
+	ssh_signal(SIGQUIT, SIG_DFL);
+	ssh_signal(SIGCHLD, SIG_DFL);
+	ssh_signal(SIGINT, SIG_DFL);
+	ssh_signal(SIGPIPE, SIG_IGN);
+	remote = get_peer_ipaddr(client_fd);
+	local = get_local_ipaddr(client_fd);
+	setproctitle("%s", "[relay]");
+	set_nodelay(client_fd);
+	if (options.tcp_keep_alive && setsockopt(client_fd, SOL_SOCKET,
+	    SO_KEEPALIVE, &on, sizeof(on)) == -1)
+		error("setsockopt relay client SO_KEEPALIVE: %s", strerror(errno));
+	if (geteuid() == 0) {
+		if (privsep_pw == NULL)
+			fatal("Privilege separation user %s does not exist",
+			    SSH_PRIVSEP_USER);
+		permanently_set_uid(privsep_pw);
+	}
+	upstream = ssh_relay_connect(options.ssh_relay_target,
+	    options.ssh_relay_connect_timeout, options.tcp_keep_alive,
+	    &host, &port);
+	if (upstream == -1) {
+		error("Relay connection from %.200s to %s failed: %s",
+		    remote, options.ssh_relay_target, strerror(errno));
+		goto out;
+	}
+	logit("Relay connection from %s on %s to %s port %d established",
+	    remote, local, host, port);
+	if (status_fd != -1) {
+		(void)atomicio(vwrite, status_fd, "\002", 1);
+		close(status_fd);
+		status_fd = -1;
+	}
+	r = ssh_relay_loop(client_fd, upstream, &client_bytes, &upstream_bytes);
+	if (r == -1)
+		error("Relay connection from %.200s to %.200s port %d: %s",
+		    remote, host, port, strerror(errno));
+	logit("Relay closed for %s: sent %llu, received %llu bytes",
+	    remote, (unsigned long long)client_bytes,
+	    (unsigned long long)upstream_bytes);
+ out:
+	if (status_fd != -1)
+		close(status_fd);
+	if (upstream != -1)
+		close(upstream);
+	if (client_fd != -1)
+		close(client_fd);
+	free(host);
+	free(remote);
+	free(local);
+	_exit(0);
 }
 
 static void
@@ -1301,6 +1381,7 @@ main(int ac, char **av)
 	struct sshkey *key;
 	struct sshkey *pubkey;
 	struct connection_info connection_info;
+	struct passwd *pw;
 	struct utsname utsname;
 	sigset_t sigmask;
 
@@ -1528,6 +1609,8 @@ main(int ac, char **av)
 
 	/* Fill in default values for those options not explicitly set. */
 	fill_default_server_options(&options);
+	if (options.ssh_relay_target != NULL && inetd_flag)
+		fatal("SSHRelayTarget is not supported in inetd mode");
 
 	/* Check that options are sensible */
 	if (options.authorized_keys_command_user == NULL &&
@@ -1566,6 +1649,17 @@ main(int ac, char **av)
 
 	if (do_dump_cfg)
 		print_config(&connection_info);
+
+	if (options.ssh_relay_target != NULL) {
+		pw = getpwnam(SSH_PRIVSEP_USER);
+		if (pw == NULL && geteuid() == 0)
+			fatal("Privilege separation user %s does not exist",
+			    SSH_PRIVSEP_USER);
+		if (pw != NULL)
+			privsep_pw = pwcopy(pw);
+		endpwent();
+		goto hostkeys_done;
+	}
 
 	/* load host keys */
 	sensitive_data.host_keys = xcalloc(options.num_host_key_files,
@@ -1718,10 +1812,13 @@ main(int ac, char **av)
 	/* Ensure privsep directory is correctly configured. */
 	need_chroot = ((getuid() == 0 || geteuid() == 0) ||
 	    options.kerberos_authentication);
-	if ((getpwnam(SSH_PRIVSEP_USER)) == NULL && need_chroot) {
+	pw = getpwnam(SSH_PRIVSEP_USER);
+	if (pw == NULL && need_chroot) {
 		fatal("Privilege separation user %s does not exist",
 		    SSH_PRIVSEP_USER);
 	}
+	if (pw != NULL)
+		privsep_pw = pwcopy(pw);
 	endpwent();
 
 	if (need_chroot) {
@@ -1739,14 +1836,17 @@ main(int ac, char **av)
 			fatal("%s must be owned by root and not group or "
 			    "world-writable.", _PATH_PRIVSEP_CHROOT_DIR);
 	}
+ hostkeys_done:
 
 	if (test_flag > 1)
 		print_config(&connection_info);
 
-	config = pack_config(cfg);
-	if (sshbuf_len(config) > MONITOR_MAX_CFGLEN) {
-		fatal("Configuration file is too large (have %zu, max %d)",
-		    sshbuf_len(config), MONITOR_MAX_CFGLEN);
+	if (options.ssh_relay_target == NULL) {
+		config = pack_config(cfg);
+		if (sshbuf_len(config) > MONITOR_MAX_CFGLEN) {
+			fatal("Configuration file is too large (have %zu, max %d)",
+			    sshbuf_len(config), MONITOR_MAX_CFGLEN);
+		}
 	}
 
 	/* Configuration looks good, so exit if in test mode. */
@@ -1764,26 +1864,30 @@ main(int ac, char **av)
 		debug("setgroups() failed: %.200s", strerror(errno));
 
 	/* Prepare arguments for sshd-session */
-	if (rexec_argc < 0)
-		fatal("rexec_argc %d < 0", rexec_argc);
-	rexec_argv = xcalloc(rexec_argc + 3, sizeof(char *));
-	/* Point to the sshd-session binary instead of sshd */
-	rexec_argv[0] = options.sshd_session_path;
-	for (i = 1; i < (u_int)rexec_argc; i++) {
-		debug("rexec_argv[%d]='%s'", i, saved_argv[i]);
-		rexec_argv[i] = saved_argv[i];
-	}
-	rexec_argv[rexec_argc++] = "-R";
-	rexec_argv[rexec_argc] = NULL;
-	if (stat(rexec_argv[0], &sb) != 0 || !(sb.st_mode & (S_IXOTH|S_IXUSR)))
-		fatal("%s does not exist or is not executable", rexec_argv[0]);
-	debug3("using %s for re-exec", rexec_argv[0]);
+	if (options.ssh_relay_target == NULL) {
+		if (rexec_argc < 0)
+			fatal("rexec_argc %d < 0", rexec_argc);
+		rexec_argv = xcalloc(rexec_argc + 3, sizeof(char *));
+		/* Point to the sshd-session binary instead of sshd */
+		rexec_argv[0] = options.sshd_session_path;
+		for (i = 1; i < (u_int)rexec_argc; i++) {
+			debug("rexec_argv[%d]='%s'", i, saved_argv[i]);
+			rexec_argv[i] = saved_argv[i];
+		}
+		rexec_argv[rexec_argc++] = "-R";
+		rexec_argv[rexec_argc] = NULL;
+		if (stat(rexec_argv[0], &sb) != 0 ||
+		    !(sb.st_mode & (S_IXOTH|S_IXUSR)))
+			fatal("%s does not exist or is not executable",
+			    rexec_argv[0]);
+		debug3("using %s for re-exec", rexec_argv[0]);
 
-	/* Ensure that the privsep binary exists now too. */
-	if (stat(options.sshd_auth_path, &sb) != 0 ||
-	    !(sb.st_mode & (S_IXOTH|S_IXUSR))) {
-		fatal("%s does not exist or is not executable",
-		    options.sshd_auth_path);
+		/* Ensure that the privsep binary exists now too. */
+		if (stat(options.sshd_auth_path, &sb) != 0 ||
+		    !(sb.st_mode & (S_IXOTH|S_IXUSR))) {
+			fatal("%s does not exist or is not executable",
+			    options.sshd_auth_path);
+		}
 	}
 
 	listener_proctitle = prepare_proctitle(ac, av);
@@ -1878,6 +1982,14 @@ main(int ac, char **av)
 	 */
 	if (!debug_flag && !inetd_flag && setsid() == -1)
 		error("setsid: %.100s", strerror(errno));
+
+	if (options.ssh_relay_target != NULL) {
+		if (debug_flag) {
+			close(config_s[1]);
+			config_s[1] = -1;
+		}
+		run_ssh_relay(newsock, config_s[1]);
+	}
 
 	debug("rexec start in %d out %d newsock %d config_s %d/%d",
 	    sock_in, sock_out, newsock, config_s[0], config_s[1]);
