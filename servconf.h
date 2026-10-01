@@ -163,6 +163,7 @@ typedef struct {
 	char   *permit_user_env_allowlist; /* pattern-list of allowed env names */
 	int     compression;	/* If true, compression is allowed */
 	int	allow_tcp_forwarding; /* One of FORWARD_* */
+	int	allow_udp_forwarding; /* authenticated outbound UDP channels */
 	int	allow_streamlocal_forwarding; /* One of FORWARD_* */
 	int	allow_agent_forwarding;
 	char	*forward_http_proxy; /* optional upstream proxy for direct-tcpip */

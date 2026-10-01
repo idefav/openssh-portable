@@ -85,6 +85,7 @@ AuthorizedKeysFile	.ssh/authorized_keys
 
 #AllowAgentForwarding yes
 #AllowTcpForwarding yes
+#AllowUdpForwarding no
 # Upstream proxy for direct-tcpip forwarding (default disabled)
 #ForwardProxy none
 # Legacy alias (default disabled)

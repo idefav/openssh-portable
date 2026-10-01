@@ -1,5 +1,34 @@
 # Portable OpenSSH
 
+## UDP forwarding in this fork
+
+Compatible ssh-tunnel desktop and iOS clients can carry UDP datagrams over
+authenticated SSH using `direct-udpip-v1@idefav.github.io`. Enable this on
+the **final SSH server**, then validate the configuration with `sshd -t`:
+
+```sshconfig
+AllowUdpForwarding yes
+# Optional: UDP exits through a SOCKS5 upstream supporting UDP ASSOCIATE.
+# ForwardProxy socks5://127.0.0.1:1080
+```
+
+`AllowTcpForwarding` is independent. `DisableForwarding`, key restrictions,
+and `PermitOpen` still apply. UDP is disabled by default. HTTP/SOCKS4 upstreams
+reject UDP; no direct fallback is performed. Existing `SSHRelayTarget` hops
+transparently relay the encrypted transport, so only the final node requires
+the UDP extension. Standard `ssh -L/-R/-D` remain unchanged.
+
+Limits: 64 UDP channels per SSH connection, 60 seconds idle, 3 seconds setup,
+65507 payload bytes (less SOCKS framing overhead when an upstream is used).
+The transport remains TCP: loss can increase latency for UDP and other SSH
+channels. See [PROTOCOL](PROTOCOL) for framing, policy and lifecycle details.
+
+For an isolated interoperability fixture, build
+`docker build -f regress/udp/Dockerfile -t ssh-udp-test:local .` and run the
+desktop client's `RUN_OPENSSH_UDP_TESTS=1 go test -race ./tunnel -run '^TestOpenSSHUDP'`.
+Tests start ephemeral containers with `--network none`, no host mounts and
+no published ports. Fixture credentials are test-only.
+
 [![C/C++ CI](../../actions/workflows/c-cpp.yml/badge.svg)](../../actions/workflows/c-cpp.yml)
 [![VM CI](../../actions/workflows/vm.yml/badge.svg)](../../actions/workflows/vm.yml)
 [![CIFuzz](../../actions/workflows/cifuzz.yml/badge.svg)](../../actions/workflows/cifuzz.yml)

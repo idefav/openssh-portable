@@ -275,7 +275,8 @@ set_fwdpermit_from_authopts(struct ssh *ssh, const struct sshauthopt *opts)
 	int port;
 	size_t i;
 
-	if ((options.allow_tcp_forwarding & FORWARD_LOCAL) != 0) {
+	if ((options.allow_tcp_forwarding & FORWARD_LOCAL) != 0 ||
+	    options.allow_udp_forwarding) {
 		channel_clear_permission(ssh, FORWARD_USER, FORWARD_LOCAL);
 		for (i = 0; i < auth_opts->npermitopen; i++) {
 			tmp = cp = xstrdup(auth_opts->permitopen[i]);
@@ -323,7 +324,8 @@ do_authenticated(struct ssh *ssh, Authctxt *authctxt)
 		channel_disable_admin(ssh, FORWARD_LOCAL);
 		channel_disable_admin(ssh, FORWARD_REMOTE);
 	} else {
-		if ((options.allow_tcp_forwarding & FORWARD_LOCAL) == 0)
+		if ((options.allow_tcp_forwarding & FORWARD_LOCAL) == 0 &&
+		    !options.allow_udp_forwarding)
 			channel_disable_admin(ssh, FORWARD_LOCAL);
 		else
 			channel_permit_all(ssh, FORWARD_LOCAL);
@@ -2678,4 +2680,3 @@ session_get_remote_name_or_ip(struct ssh *ssh, u_int utmp_size, int use_dns)
 		remote = ssh_remote_ipaddr(ssh);
 	return remote;
 }
-

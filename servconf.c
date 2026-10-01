@@ -143,6 +143,7 @@ initialize_server_options(ServerOptions *options)
 	options->rekey_limit = -1;
 	options->rekey_interval = -1;
 	options->allow_tcp_forwarding = -1;
+	options->allow_udp_forwarding = -1;
 	options->allow_streamlocal_forwarding = -1;
 	options->allow_agent_forwarding = -1;
 	options->forward_http_proxy = NULL;
@@ -404,6 +405,8 @@ fill_default_server_options(ServerOptions *options)
 		options->rekey_interval = 0;
 	if (options->allow_tcp_forwarding == -1)
 		options->allow_tcp_forwarding = FORWARD_ALLOW;
+	if (options->allow_udp_forwarding == -1)
+		options->allow_udp_forwarding = 0;
 	if (options->allow_streamlocal_forwarding == -1)
 		options->allow_streamlocal_forwarding = FORWARD_ALLOW;
 	if (options->allow_agent_forwarding == -1)
@@ -562,7 +565,7 @@ typedef enum {
 	sX11Forwarding, sX11DisplayOffset, sX11UseLocalhost,
 	sPermitTTY, sStrictModes, sEmptyPasswd, sTCPKeepAlive,
 	sPermitUserEnvironment, sAllowTcpForwarding, sCompression,
-	sForwardHttpProxy, sForwardProxy, sSSHRelayTarget,
+	sForwardHttpProxy, sForwardProxy, sSSHRelayTarget, sAllowUdpForwarding,
 	sSSHRelayConnectTimeout,
 	sRekeyLimit, sAllowUsers, sDenyUsers, sAllowGroups, sDenyGroups,
 	sIgnoreUserKnownHosts, sCiphers, sMacs, sPidFile, sModuliFile,
@@ -695,6 +698,7 @@ static struct {
 	{ "tcpkeepalive", sTCPKeepAlive, SSHCFG_GLOBAL },
 	{ "keepalive", sTCPKeepAlive, SSHCFG_GLOBAL },	/* obsolete alias */
 	{ "allowtcpforwarding", sAllowTcpForwarding, SSHCFG_ALL },
+	{ "allowudpforwarding", sAllowUdpForwarding, SSHCFG_ALL },
 	{ "forwardproxy", sForwardProxy, SSHCFG_ALL },
 	{ "forwardhttpproxy", sForwardHttpProxy, SSHCFG_ALL },
 	{ "sshrelaytarget", sSSHRelayTarget, SSHCFG_GLOBAL },
@@ -1860,6 +1864,9 @@ process_server_config_line_depth(ServerOptions *options, char *line,
 		intptr = &options->allow_tcp_forwarding;
 		multistate_ptr = multistate_tcpfwd;
 		goto parse_multistate;
+	case sAllowUdpForwarding:
+		intptr = &options->allow_udp_forwarding;
+		goto parse_flag;
 
 	case sAllowStreamLocalForwarding:
 		intptr = &options->allow_streamlocal_forwarding;
@@ -3016,6 +3023,7 @@ copy_set_server_options(ServerOptions *dst, ServerOptions *src, int preauth)
 	M_CP_INTOPT(ignore_rhosts);
 
 	M_CP_INTOPT(allow_tcp_forwarding);
+	M_CP_INTOPT(allow_udp_forwarding);
 	M_CP_INTOPT(allow_streamlocal_forwarding);
 	M_CP_INTOPT(allow_agent_forwarding);
 	M_CP_INTOPT(disable_forwarding);
@@ -3368,6 +3376,7 @@ dump_config(ServerOptions *o)
 	dump_cfg_fmtint(sGatewayPorts, o->fwd_opts.gateway_ports);
 	dump_cfg_fmtint(sUseDNS, o->use_dns);
 	dump_cfg_fmtint(sAllowTcpForwarding, o->allow_tcp_forwarding);
+	dump_cfg_fmtint(sAllowUdpForwarding, o->allow_udp_forwarding);
 	dump_cfg_string(sForwardProxy, o->forward_http_proxy);
 	dump_cfg_string(sSSHRelayTarget, o->ssh_relay_target);
 	dump_cfg_fmtint(sAllowAgentForwarding, o->allow_agent_forwarding);

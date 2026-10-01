@@ -718,4 +718,60 @@ master instance and later clients.
 OpenSSH extends the usual agent protocol. These changes are documented
 in the PROTOCOL.agent file.
 
+6. Private fork extension: UDP forwarding v1
+
+This fork implements "direct-udpip-v1@idefav.github.io". It is not an
+OpenSSH upstream or IETF standard channel. Ordinary SSH clients retain
+their existing TCP forwarding behavior.
+
+An authenticated client can send an empty SSH_MSG_GLOBAL_REQUEST named
+"udp-forwarding-v1@idefav.github.io", with want-reply true. A supporting
+server replies SUCCESS and one byte: 0 available, 1 administratively
+disabled (including key restrictions), 2 unsupported ForwardProxy type.
+This is a capability/policy result, not a reachability test. Target ACLs,
+capacity, upstream authentication and destination setup are checked when
+opening a channel. A legacy server replies REQUEST_FAILURE.
+
+The channel open uses the normal channel header followed by:
+    string  destination host (nonempty, at most 255 bytes)
+    uint32  destination port (1..65535)
+
+The server acknowledges only after connecting a UDP socket, or after a
+SOCKS5 UDP ASSOCIATE has succeeded. A UDP socket connect does not prove
+that the destination is reachable. The connected UDP socket filters
+responses to the chosen peer. One association/channel has one target.
+
+Both directions use an ordinary SSH byte stream containing:
+    uint32  datagram payload length (big endian, 0..65507)
+    byte[]  payload
+
+These are explicit application framing bytes. SSH channel message
+boundaries have no meaning; a frame may span messages or share a message
+with another frame. The four length bytes consume channel window space.
+Zero length is a valid UDP datagram. Lengths over 65507 close that channel.
+EOF/close ends the entire association; UDP has no half-close semantics.
+
+Each SSH connection is limited to 64 UDP channels. Each channel uses a
+128 KiB receive window, at most two pending maximum-sized receive frames,
+a 3 second setup deadline and a 60 second bidirectional inactivity timer.
+Congestion may drop whole UDP datagrams; packets are never replayed on a
+new SSH connection. There is no reliability or latency guarantee beyond
+the underlying TCP transport.
+
+ForwardProxy none sends UDP from the SSH server. socks5:// uses RFC 1928
+UDP ASSOCIATE (optional RFC 1929 username/password); the TCP control
+connection lives with its UDP association. SOCKS reserved fields, FRAG=0,
+source endpoint and numeric target addresses/ports are checked. Domains
+are passed to the SOCKS server. An unspecified BND.ADDR uses the TCP
+proxy peer address. Packets whose payload plus SOCKS header exceeds
+65507 are dropped, never truncated. HTTP and SOCKS4 never fall back to
+direct UDP. No SOCKS fragmentation, remote UDP listener, broadcast or
+multicast discovery is provided.
+
+AllowUdpForwarding defaults to no and supports Match. It is independent
+of AllowTcpForwarding; DisableForwarding, authorized_keys restrictions
+and the existing PermitOpen host/port ACL apply to both transports.
+SSHRelayTarget only relays the encrypted byte stream and needs no UDP
+extension at intermediate hops; the final authenticated server does.
+
 $OpenBSD: PROTOCOL,v 1.60 2026/02/09 22:09:48 dtucker Exp $

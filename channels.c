@@ -74,6 +74,7 @@
 #include "misc.h"
 #include "atomicio.h"
 #include "channels.h"
+#include "udp-channel.h"
 #include "compat.h"
 #include "canohost.h"
 #include "pathnames.h"
@@ -818,6 +819,7 @@ channel_free(struct ssh *ssh, Channel *c)
 	}
 
 	channel_close_fds(ssh, c);
+	udp_channel_free(c);
 	sshbuf_free(c->input);
 	sshbuf_free(c->output);
 	sshbuf_free(c->extended);
@@ -1337,6 +1339,10 @@ channel_pre_listener(struct ssh *ssh, Channel *c)
 static void
 channel_pre_connecting(struct ssh *ssh, Channel *c)
 {
+	if (c->udp != NULL) {
+		udp_channel_pre(ssh, c);
+		return;
+	}
 	debug3("channel %d: waiting for connection", c->self);
 	c->io_want = SSH_CHAN_IO_SOCK_W;
 }
@@ -1344,6 +1350,10 @@ channel_pre_connecting(struct ssh *ssh, Channel *c)
 static void
 channel_pre_open(struct ssh *ssh, Channel *c)
 {
+	if (c->udp != NULL) {
+		udp_channel_pre(ssh, c);
+		return;
+	}
 	c->io_want = 0;
 	if (c->istate == CHAN_INPUT_OPEN &&
 	    c->remote_window > 0 &&
@@ -2125,6 +2135,10 @@ channel_post_connecting(struct ssh *ssh, Channel *c)
 {
 	int err = 0, sock, isopen, r;
 	socklen_t sz = sizeof(err);
+	if (c->udp != NULL) {
+		udp_channel_post(ssh, c);
+		return;
+	}
 
 	if ((c->io_ready & SSH_CHAN_IO_SOCK_W) == 0)
 		return;
@@ -2475,6 +2489,11 @@ channel_check_window(struct ssh *ssh, Channel *c)
 static void
 channel_post_open(struct ssh *ssh, Channel *c)
 {
+	if (c->udp != NULL) {
+		udp_channel_post(ssh, c);
+		channel_check_window(ssh, c);
+		return;
+	}
 	channel_handle_rfd(ssh, c);
 	channel_handle_wfd(ssh, c);
 	channel_handle_efd(ssh, c);
@@ -2712,6 +2731,9 @@ channel_handler(struct ssh *ssh, int table, struct timespec *timeout)
 				continue;
 		}
 		if (ftab[c->type] != NULL) {
+			if (timeout != NULL && c->udp != NULL)
+				ptimeout_deadline_monotime(timeout,
+				    udp_channel_expiry(c));
 			if (table == CHAN_PRE && c->type == SSH_CHANNEL_OPEN &&
 			    channel_get_expiry(ssh, c) != 0 &&
 			    now >= channel_get_expiry(ssh, c)) {
@@ -5560,6 +5582,46 @@ proxy_connect(struct ssh *ssh, const char *proxy_spec,
 			*errmsg = "unsupported ForwardProxy scheme";
 		return -1;
 	}
+}
+
+/* UDP uses the same target ACL, with its own server-side enable switch. */
+Channel *
+channel_connect_udp(struct ssh *ssh, const char *host, u_short port,
+    const char *proxy, int *reason, const char **errmsg)
+{
+	char *ph = NULL, *pu = NULL, *pp = NULL;
+	int pn = 0;
+	u_int i, count = 0;
+	Channel *c = NULL;
+
+	if (!channel_check_port_open_permission(ssh, host, port, reason))
+		return NULL;
+	for (i = 0; i < ssh->chanctxt->channels_alloc; i++) {
+		if (ssh->chanctxt->channels[i] != NULL &&
+		    ssh->chanctxt->channels[i]->udp != NULL)
+			count++;
+	}
+	if (count >= 64) {
+		*reason = SSH2_OPEN_RESOURCE_SHORTAGE;
+		*errmsg = "UDP channel capacity reached";
+		return NULL;
+	}
+	if (proxy != NULL && (strncasecmp(proxy, "socks5://", 9) != 0 ||
+	    parse_http_proxy_spec(proxy + 9, &ph, &pn, &pu, &pp) != 0)) {
+		*reason = SSH2_OPEN_ADMINISTRATIVELY_PROHIBITED;
+		*errmsg = "UDP requires a SOCKS5 upstream";
+		goto out;
+	}
+	c = udp_channel_new(ssh, host, port, ph, pn, pu, pp);
+	if (c == NULL) {
+		*reason = SSH2_OPEN_CONNECT_FAILED;
+		*errmsg = "UDP endpoint setup failed";
+	}
+ out:
+	free(ph);
+	if (pu != NULL) freezero(pu, strlen(pu));
+	if (pp != NULL) freezero(pp, strlen(pp));
+	return c;
 }
 
 /* Check if connecting to that port is permitted and connect. */

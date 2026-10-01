@@ -38,6 +38,9 @@ sshd-auth
 tags
 regress/*
 !regress/ssh-relay.sh
+!regress/udp/
+!regress/udp/Dockerfile
+!regress/udp/fixture.py
 
 # Ignored on main branch
 config.h.in

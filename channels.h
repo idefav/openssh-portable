@@ -202,6 +202,7 @@ struct Channel {
 
 	/* keep boundaries */
 	int			datagram;
+	struct udp_channel	*udp;
 
 	/* non-blocking connect */
 	/* XXX make this a pointer so the structure can be opaque */
@@ -230,6 +231,11 @@ struct Channel {
 #define CHAN_SES_WINDOW_DEFAULT	(64*CHAN_SES_PACKET_DEFAULT)
 #define CHAN_TCP_PACKET_DEFAULT	(32*1024)
 #define CHAN_TCP_WINDOW_DEFAULT	(64*CHAN_TCP_PACKET_DEFAULT)
+
+#define SSH_UDP_CHANNEL "direct-udpip-v1@idefav.github.io"
+#define SSH_UDP_CAPABILITY "udp-forwarding-v1@idefav.github.io"
+Channel *channel_connect_udp(struct ssh *, const char *, u_short,
+    const char *, int *, const char **);
 #define CHAN_X11_PACKET_DEFAULT	(16*1024)
 #define CHAN_X11_WINDOW_DEFAULT	(4*CHAN_X11_PACKET_DEFAULT)
 

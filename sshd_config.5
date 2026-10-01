@@ -161,6 +161,31 @@ to allow remote forwarding only.
 Note that disabling TCP forwarding does not improve security unless
 users are also denied shell access, as they can always install their
 own forwarders.
+.It Cm AllowUdpForwarding
+Specifies whether the private
+.Cm direct-udpip-v1@idefav.github.io
+channel extension is permitted.
+The argument is
+.Cm yes
+or
+.Cm no
+(the default).
+This permits authenticated outbound unicast UDP associations independently of
+.Cm AllowTcpForwarding .
+.Cm DisableForwarding ,
+authorized key forwarding restrictions, and
+.Cm PermitOpen
+still apply.
+If
+.Cm ForwardProxy
+is configured, only SOCKS5 UDP ASSOCIATE is supported; other proxy types
+reject UDP without falling back to direct egress.
+Each SSH connection permits at most 64 UDP channels, with a 60 second
+inactivity timeout and a 3 second setup timeout.
+This extension requires a compatible client; it does not add UDP support
+to the standard
+.Xr ssh 1
+port forwarding options.
 .It Cm AllowUsers
 This keyword can be followed by a list of user name patterns, separated
 by spaces.
@@ -1362,6 +1387,7 @@ Available keywords are
 .Cm AllowGroups ,
 .Cm AllowStreamLocalForwarding ,
 .Cm AllowTcpForwarding ,
+.Cm AllowUdpForwarding ,
 .Cm AllowUsers ,
 .Cm AuthenticationMethods ,
 .Cm AuthorizedKeysCommand ,
@@ -1523,7 +1549,8 @@ treated differently to explicit localhost addresses of
 and
 .Dq ::1 .
 .It Cm PermitOpen
-Specifies the destinations to which TCP port forwarding is permitted.
+Specifies the destinations to which TCP port forwarding and this fork's
+UDP forwarding are permitted.
 The forwarding specification must be one of the following forms:
 .Pp
 .Bl -item -offset indent -compact
