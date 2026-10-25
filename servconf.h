@@ -163,8 +163,12 @@ typedef struct {
 	char   *permit_user_env_allowlist; /* pattern-list of allowed env names */
 	int     compression;	/* If true, compression is allowed */
 	int	allow_tcp_forwarding; /* One of FORWARD_* */
+	int	allow_udp_forwarding; /* authenticated outbound UDP channels */
 	int	allow_streamlocal_forwarding; /* One of FORWARD_* */
 	int	allow_agent_forwarding;
+	char	*forward_http_proxy; /* optional upstream proxy for direct-tcpip */
+	char	*ssh_relay_target; /* optional transparent SSH relay target */
+	int	ssh_relay_connect_timeout;
 	int	disable_forwarding;
 	u_int num_allow_users;
 	char   **allow_users;
@@ -301,6 +305,7 @@ TAILQ_HEAD(include_list, include_item);
 		M_CP_STROPT(pubkey_accepted_algos); \
 		M_CP_STROPT(ca_sign_algorithms); \
 		M_CP_STROPT(routing_domain); \
+		M_CP_STROPT(forward_http_proxy); \
 		M_CP_STROPT(permit_user_env_allowlist); \
 		M_CP_STROPT(pam_service_name); \
 		M_CP_STRARRAYOPT(authorized_keys_files, num_authkeys_files, 1);\

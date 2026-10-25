@@ -446,8 +446,14 @@ server_request_direct_tcpip(struct ssh *ssh, int *reason, const char **errmsg)
 	if ((options.allow_tcp_forwarding & FORWARD_LOCAL) != 0 &&
 	    auth_opts->permit_port_forwarding_flag &&
 	    !options.disable_forwarding) {
-		c = channel_connect_to_port(ssh, target, target_port,
-		    "direct-tcpip", "direct-tcpip", reason, errmsg);
+		if (options.forward_http_proxy != NULL) {
+			c = channel_connect_to_port_via_proxy(ssh,
+			    target, target_port, options.forward_http_proxy,
+			    "direct-tcpip", "direct-tcpip", reason, errmsg);
+		} else {
+			c = channel_connect_to_port(ssh, target, target_port,
+			    "direct-tcpip", "direct-tcpip", reason, errmsg);
+		}
 	} else {
 		logit("refused local port forward: "
 		    "originator %s port %d, target %s port %d",
@@ -459,6 +465,32 @@ server_request_direct_tcpip(struct ssh *ssh, int *reason, const char **errmsg)
  out:
 	free(originator);
 	free(target);
+	return c;
+}
+
+static Channel *
+server_request_direct_udp(struct ssh *ssh, int *reason, const char **errmsg)
+{
+	char *host = NULL;
+	u_int port;
+	int r;
+	Channel *c = NULL;
+
+	if ((r = sshpkt_get_cstring(ssh, &host, NULL)) != 0 ||
+	    (r = sshpkt_get_u32(ssh, &port)) != 0 ||
+	    (r = sshpkt_get_end(ssh)) != 0)
+		sshpkt_fatal(ssh, r, "%s: parse packet", __func__);
+	*reason = SSH2_OPEN_ADMINISTRATIVELY_PROHIBITED;
+	if (!options.allow_udp_forwarding || options.disable_forwarding ||
+	    !auth_opts->permit_port_forwarding_flag) {
+		*errmsg = "UDP forwarding disabled";
+	} else if (port == 0 || port > 65535 || *host == '\0' || strlen(host) > 255) {
+		*errmsg = "Invalid UDP destination";
+	} else {
+		c = channel_connect_udp(ssh, host, port,
+		    options.forward_http_proxy, reason, errmsg);
+	}
+	free(host);
 	return c;
 }
 
@@ -628,6 +660,8 @@ server_input_channel_open(int type, u_int32_t seq, struct ssh *ssh)
 		c = server_request_session(ssh);
 	} else if (strcmp(ctype, "direct-tcpip") == 0) {
 		c = server_request_direct_tcpip(ssh, &reason, &errmsg);
+	} else if (strcmp(ctype, SSH_UDP_CHANNEL) == 0) {
+		c = server_request_direct_udp(ssh, &reason, &errmsg);
 	} else if (strcmp(ctype, "direct-streamlocal@openssh.com") == 0) {
 		c = server_request_direct_streamlocal(ssh);
 	} else if (strcmp(ctype, "tun@openssh.com") == 0) {
@@ -772,7 +806,21 @@ server_input_global_request(int type, u_int32_t seq, struct ssh *ssh)
 	debug_f("rtype %s want_reply %d", rtype, want_reply);
 
 	/* -R style forwarding */
-	if (strcmp(rtype, "tcpip-forward") == 0) {
+	if (strcmp(rtype, SSH_UDP_CAPABILITY) == 0) {
+		u_char status = 0;
+		if ((r = sshpkt_get_end(ssh)) != 0)
+			sshpkt_fatal(ssh, r, "UDP capability request");
+		if (!options.allow_udp_forwarding || options.disable_forwarding ||
+		    !auth_opts->permit_port_forwarding_flag)
+			status = 1;
+		else if (options.forward_http_proxy != NULL &&
+		    strncasecmp(options.forward_http_proxy, "socks5://", 9) != 0)
+			status = 2;
+		resp = sshbuf_new();
+		if (resp == NULL || (r = sshbuf_put_u8(resp, status)) != 0)
+			fatal("UDP capability response");
+		success = 1;
+	} else if (strcmp(rtype, "tcpip-forward") == 0) {
 		if ((r = sshpkt_get_cstring(ssh, &fwd.listen_host, NULL)) != 0 ||
 		    (r = sshpkt_get_u32(ssh, &port)) != 0)
 			sshpkt_fatal(ssh, r, "%s: parse tcpip-forward", __func__);

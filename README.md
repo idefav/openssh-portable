@@ -1,5 +1,34 @@
 # Portable OpenSSH
 
+## UDP forwarding in this fork
+
+Compatible ssh-tunnel desktop and iOS clients can carry UDP datagrams over
+authenticated SSH using `direct-udpip-v1@idefav.github.io`. Enable this on
+the **final SSH server**, then validate the configuration with `sshd -t`:
+
+```sshconfig
+AllowUdpForwarding yes
+# Optional: UDP exits through a SOCKS5 upstream supporting UDP ASSOCIATE.
+# ForwardProxy socks5://127.0.0.1:1080
+```
+
+`AllowTcpForwarding` is independent. `DisableForwarding`, key restrictions,
+and `PermitOpen` still apply. UDP is disabled by default. HTTP/SOCKS4 upstreams
+reject UDP; no direct fallback is performed. Existing `SSHRelayTarget` hops
+transparently relay the encrypted transport, so only the final node requires
+the UDP extension. Standard `ssh -L/-R/-D` remain unchanged.
+
+Limits: 64 UDP channels per SSH connection, 60 seconds idle, 3 seconds setup,
+65507 payload bytes (less SOCKS framing overhead when an upstream is used).
+The transport remains TCP: loss can increase latency for UDP and other SSH
+channels. See [PROTOCOL](PROTOCOL) for framing, policy and lifecycle details.
+
+For an isolated interoperability fixture, build
+`docker build -f regress/udp/Dockerfile -t ssh-udp-test:local .` and run the
+desktop client's `RUN_OPENSSH_UDP_TESTS=1 go test -race ./tunnel -run '^TestOpenSSHUDP'`.
+Tests start ephemeral containers with `--network none`, no host mounts and
+no published ports. Fixture credentials are test-only.
+
 [![C/C++ CI](../../actions/workflows/c-cpp.yml/badge.svg)](../../actions/workflows/c-cpp.yml)
 [![VM CI](../../actions/workflows/vm.yml/badge.svg)](../../actions/workflows/vm.yml)
 [![CIFuzz](../../actions/workflows/cifuzz.yml/badge.svg)](../../actions/workflows/cifuzz.yml)
@@ -64,6 +93,308 @@ cd openssh-portable
 autoreconf
 ./configure
 make && make tests
+```
+
+### Running targeted forwarding regress tests
+
+When you only want to validate dynamic forwarding paths (including
+``ForwardProxy``), you can run just these tests against the binaries in
+your current build tree:
+
+```
+make -C regress t-exec \
+	.CURDIR="$PWD/regress" .OBJDIR="$PWD/regress" OBJ="$PWD/regress" \
+	TEST_SHELL=sh \
+	LTESTS='dynamic-forward forward-http-proxy' \
+	TEST_SSH_UNSAFE_PERMISSIONS=1 \
+	TEST_SSH_SSH="$PWD/ssh" \
+	TEST_SSH_SSHD="$PWD/sshd" \
+	TEST_SSH_SSHD_SESSION="$PWD/sshd-session" \
+	TEST_SSH_SSHD_AUTH="$PWD/sshd-auth" \
+	TEST_SSH_SSHAGENT="$PWD/ssh-agent" \
+	TEST_SSH_SSHADD="$PWD/ssh-add" \
+	TEST_SSH_SSHKEYGEN="$PWD/ssh-keygen" \
+	TEST_SSH_SSHKEYSCAN="$PWD/ssh-keyscan" \
+	TEST_SSH_SFTP="$PWD/sftp" \
+	TEST_SSH_SFTPSERVER="$PWD/sftp-server" \
+	TEST_SSH_SCP="$PWD/scp"
+```
+
+The ``TEST_SSH_*`` overrides ensure the regress harness uses your freshly built
+binaries instead of any system-installed OpenSSH.
+
+If you prefer a compact one-liner, use:
+
+```
+BIN="$PWD"; make -C regress t-exec .CURDIR="$PWD/regress" .OBJDIR="$PWD/regress" OBJ="$PWD/regress" TEST_SHELL=sh LTESTS='dynamic-forward forward-http-proxy ssh-relay' TEST_SSH_UNSAFE_PERMISSIONS=1 TEST_SSH_SSH="$BIN/ssh" TEST_SSH_SSHD="$BIN/sshd" TEST_SSH_SSHD_SESSION="$BIN/sshd-session" TEST_SSH_SSHD_AUTH="$BIN/sshd-auth" TEST_SSH_SSHAGENT="$BIN/ssh-agent" TEST_SSH_SSHADD="$BIN/ssh-add" TEST_SSH_SSHKEYGEN="$BIN/ssh-keygen" TEST_SSH_SSHKEYSCAN="$BIN/ssh-keyscan" TEST_SSH_SFTP="$BIN/sftp" TEST_SSH_SFTPSERVER="$BIN/sftp-server" TEST_SSH_SCP="$BIN/scp"
+```
+
+To run only the ``forward-http-proxy`` test:
+
+```
+BIN="$PWD"; make -C regress t-exec .CURDIR="$PWD/regress" .OBJDIR="$PWD/regress" OBJ="$PWD/regress" TEST_SHELL=sh LTESTS='forward-http-proxy' TEST_SSH_UNSAFE_PERMISSIONS=1 TEST_SSH_SSH="$BIN/ssh" TEST_SSH_SSHD="$BIN/sshd" TEST_SSH_SSHD_SESSION="$BIN/sshd-session" TEST_SSH_SSHD_AUTH="$BIN/sshd-auth" TEST_SSH_SSHAGENT="$BIN/ssh-agent" TEST_SSH_SSHADD="$BIN/ssh-add" TEST_SSH_SSHKEYGEN="$BIN/ssh-keygen" TEST_SSH_SSHKEYSCAN="$BIN/ssh-keyscan" TEST_SSH_SFTP="$BIN/sftp" TEST_SSH_SFTPSERVER="$BIN/sftp-server" TEST_SSH_SCP="$BIN/scp"
+```
+
+### ForwardProxy update summary
+
+This repository now includes server-side support for server-side forwarding
+via upstream proxies using ``ForwardProxy``.
+
+Highlights:
+
+* Added ``ForwardProxy`` parsing and config plumbing in the server config
+	path.
+* Added server channel connect support for HTTP ``CONNECT`` and SOCKS
+	(``socks4``/``socks5``) tunneling.
+* Wired ``direct-tcpip`` handling to use the configured upstream proxy when
+	``ForwardProxy`` is set.
+* Documented ``ForwardProxy`` in ``sshd_config(5)``.
+* Added a regress test, ``regress/forward-http-proxy.sh``, that validates
+	dynamic forwarding through a local HTTP CONNECT proxy.
+
+Scope note:
+
+* This is implemented at server ``direct-tcpip`` channel handling scope.
+	Therefore, it applies to ``direct-tcpip`` channels handled by ``sshd``
+	(including dynamic forwarding traffic), rather than introducing a protocol
+	marker that uniquely identifies ``-D`` at the server.
+
+Validation performed:
+
+* ``make tests`` completed successfully in this environment.
+* Targeted regress runs passed for both
+	``dynamic-forward`` and ``forward-http-proxy``.
+
+Usage example:
+
+1) Configure server-side proxying in ``sshd_config`` (``http``/``socks4``/
+   ``socks5``):
+
+```
+AllowTcpForwarding yes
+ForwardProxy http://127.0.0.1:3081
+```
+
+	If your HTTP proxy requires authentication, include credentials:
+
+```
+AllowTcpForwarding yes
+ForwardProxy http://proxyuser:proxypass@127.0.0.1:3081
+```
+
+	This sends a ``Proxy-Authorization: Basic ...`` header on ``CONNECT``.
+
+	For SOCKS4/SOCKS5, switch by scheme:
+
+```
+AllowTcpForwarding yes
+ForwardProxy socks4://proxyuser@127.0.0.1:1080
+```
+
+```
+AllowTcpForwarding yes
+ForwardProxy socks5://proxyuser:proxypass@127.0.0.1:1080
+```
+
+2) Restart ``sshd`` and create a dynamic SOCKS tunnel from the client:
+
+```
+ssh -D 127.0.0.1:1080 -N user@server
+```
+
+3) Send traffic through the SOCKS tunnel (example with ``curl``):
+
+```
+curl --socks5-hostname 127.0.0.1:1080 http://example.com/
+```
+
+With ``ForwardProxy`` set, server handling of ``direct-tcpip`` channels
+(including traffic from ``-D`` dynamic forwarding) will egress through the
+configured HTTP or SOCKS proxy.
+
+### Transparent SSH relay
+
+A dedicated ``sshd`` instance may relay its complete incoming TCP stream to a
+fixed second SSH server before any SSH handshake takes place.  For example,
+create ``/etc/ssh/sshd_relay_config`` on relay host A:
+
+```
+Port 11111
+ListenAddress 0.0.0.0
+PidFile /run/sshd-relay.pid
+SSHRelayTarget B.example.com:22
+SSHRelayConnectTimeout 10s
+```
+
+Validate and start the dedicated relay instance:
+
+```
+sudo /usr/local/sbin/sshd -t -f /etc/ssh/sshd_relay_config
+sudo /usr/local/sbin/sshd -f /etc/ssh/sshd_relay_config
+```
+
+Connect to A using the username and authentication method accepted by B:
+
+```
+ssh -p 11111 idefav@A.example.com
+```
+
+The client connects to the relay address but sees the target server's host key
+and authenticates directly to the target.  The relay never receives or
+replays the SSH username, password, private-key signature or channel data.
+Host-key checking must therefore associate this endpoint with B's host key.
+Use another ``sshd`` instance and port for administrative access to relay host
+A; every connection accepted by the relay instance is forwarded to B.
+
+On the target server, ``ForwardProxy`` may then proxy ``direct-tcpip`` traffic
+created by ``ssh -D`` or ``ssh -L``:
+
+```
+AllowTcpForwarding yes
+ForwardProxy socks5://proxyuser:proxypass@127.0.0.1:1080
+```
+
+Ordinary shell, exec, SCP and SFTP traffic terminates at the target SSH server;
+only forwarding channels are sent through ``ForwardProxy``.
+
+Relay instances may be chained.  In an A to B to C chain, configure A with
+``SSHRelayTarget B.example.com:11111`` and configure B's relay instance with
+``SSHRelayTarget C.example.com:22``.  The client still performs a single SSH
+handshake and authenticates only to C.  Configure ``ForwardProxy`` on C if C
+is the server that terminates SSH and handles forwarding channels.
+
+Running ``sshd`` with a specific config file:
+
+``sshd`` supports an explicit config path via ``-f``.
+
+1) Validate config syntax before starting:
+
+```
+./sshd -t -f /path/to/sshd_config
+```
+
+2) Run in foreground (useful for debugging):
+
+```
+./sshd -D -e -f /path/to/sshd_config
+```
+
+3) Run with default daemon behaviour but custom config file:
+
+```
+./sshd -f /path/to/sshd_config
+```
+
+``sshd_config`` template (baseline/default style):
+
+The following example is a practical baseline template you can copy to start
+from (adjust paths/users for your system):
+
+```
+# Network
+Port 22
+AddressFamily any
+ListenAddress 0.0.0.0
+ListenAddress ::
+
+# Host keys (use the paths generated on your host)
+HostKey /etc/ssh/ssh_host_ed25519_key
+HostKey /etc/ssh/ssh_host_rsa_key
+
+# Authentication
+PermitRootLogin prohibit-password
+PubkeyAuthentication yes
+PasswordAuthentication yes
+KbdInteractiveAuthentication yes
+UsePAM yes
+
+# Session/security defaults
+X11Forwarding no
+PermitEmptyPasswords no
+ChallengeResponseAuthentication no
+PrintMotd no
+
+# Forwarding
+AllowTcpForwarding yes
+AllowAgentForwarding yes
+AllowStreamLocalForwarding yes
+# Upstream proxy for direct-tcpip (server-side forwarding egress)
+# Default disabled:
+ForwardProxy none
+#
+# Enable with one of the following formats:
+#   ForwardProxy http://127.0.0.1:3081
+#   ForwardProxy socks4://127.0.0.1:1080
+#   ForwardProxy socks5://127.0.0.1:1080
+#
+# With authentication:
+#   HTTP Basic auth:
+#     ForwardProxy http://proxyuser:proxypass@127.0.0.1:3081
+#   SOCKS4 user field:
+#     ForwardProxy socks4://proxyuser@127.0.0.1:1080
+#   SOCKS5 username/password auth:
+#     ForwardProxy socks5://proxyuser:proxypass@127.0.0.1:1080
+#
+# Legacy alias (kept for compatibility, maps to ForwardProxy):
+#   ForwardHttpProxy 127.0.0.1:3081
+
+# Transparent SSH relay (dedicated sshd instance only)
+# Default disabled:
+SSHRelayTarget none
+# Maximum total time to connect to the next relay/target:
+SSHRelayConnectTimeout 10s
+#
+# Enable with an explicit target port:
+#   SSHRelayTarget B.example.com:22
+#   SSHRelayTarget [2001:db8::b]:22
+#
+# When enabled, this sshd does not authenticate users or terminate SSH.
+# Run it with a dedicated config/listen port and keep a separate normal sshd
+# instance for administrative access to this host.
+
+# Keepalive
+ClientAliveInterval 0
+ClientAliveCountMax 3
+
+# SFTP subsystem
+Subsystem sftp /usr/local/libexec/sftp-server
+```
+
+Test template before reload/restart:
+
+```
+./sshd -t -f /path/to/sshd_config
+```
+
+Running ``sshd`` via ``systemd``:
+
+You can create a dedicated service unit that points to a specific config file.
+Example ``/etc/systemd/system/sshd-custom.service``:
+
+```
+[Unit]
+Description=OpenSSH server daemon (custom config)
+After=network.target
+
+[Service]
+Type=notify
+ExecStart=/usr/local/sbin/sshd -D -e -f /path/to/sshd_config
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=process
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Apply and manage:
+
+```
+sudo systemctl daemon-reload
+sudo systemctl enable --now sshd-custom.service
+sudo systemctl status sshd-custom.service
+sudo systemctl restart sshd-custom.service
 ```
 
 ### Build-time Customisation
