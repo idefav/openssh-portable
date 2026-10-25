@@ -2,6 +2,8 @@
 
 ## UDP forwarding in this fork
 
+For a separate listener that preserves the original management SSH service, see [UDP deployment](README.udp-deployment.md) and [systemd unit](contrib/sshd-udp.service).
+
 Compatible ssh-tunnel desktop and iOS clients can carry UDP datagrams over
 authenticated SSH using `direct-udpip-v1@idefav.github.io`. Enable this on
 the **final SSH server**, then validate the configuration with `sshd -t`:
