@@ -29,6 +29,7 @@
 #include <ctype.h>
 #include <glob.h>
 #include <netdb.h>
+#include <arpa/inet.h>
 #include <pwd.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -76,6 +77,67 @@ static void parse_server_config_depth(ServerOptions *options,
     struct connection_info *connectinfo, int flags, int *activep, int depth);
 
 extern struct sshbuf *cfg;
+
+/* No resolution, wildcard or CIDR matching is permitted for this exception. */
+static int
+forward_proxy_bypass_endpoint(const char *text, int *family,
+    u_char *address, int *portp)
+{
+	char *copy = xstrdup(text), *rest = copy, *host;
+	const char *err = NULL;
+	struct in_addr v4;
+	struct in6_addr v6;
+	int port, af = 0;
+
+	host = hpdelim(&rest);
+	if (host == NULL || rest == NULL || *rest == '\0')
+		goto out;
+	host = cleanhostname(host);
+	if (strspn(rest, "0123456789") != strlen(rest))
+		goto out;
+	port = (int)strtonum(rest, 1, 65535, &err);
+	if (err != NULL)
+		goto out;
+	if (inet_pton(AF_INET, host, &v4) == 1 &&
+	    (ntohl(v4.s_addr) >> 24) == 127) {
+		af = AF_INET;
+		if (address != NULL) memcpy(address, &v4, sizeof(v4));
+	} else if (inet_pton(AF_INET6, host, &v6) == 1 &&
+	    IN6_IS_ADDR_LOOPBACK(&v6)) {
+		af = AF_INET6;
+		if (address != NULL) memcpy(address, &v6, sizeof(v6));
+	}
+	if (af != 0) {
+		if (family != NULL) *family = af;
+		if (portp != NULL) *portp = port;
+	}
+ out:
+	free(copy);
+	return af != 0;
+}
+
+int
+forward_proxy_bypass_matches(const ServerOptions *o, const char *host, int port)
+{
+	u_char target[16], address[16];
+	int af, expected, endpoint_port;
+	u_int i;
+
+	if (inet_pton(AF_INET, host, target) == 1)
+		af = AF_INET;
+	else if (inet_pton(AF_INET6, host, target) == 1)
+		af = AF_INET6;
+	else
+		return 0;
+	for (i = 0; i < o->num_forward_proxy_bypass; i++) {
+		if (forward_proxy_bypass_endpoint(o->forward_proxy_bypass[i],
+		    &expected, address, &endpoint_port) && expected == af &&
+		    port == endpoint_port && memcmp(target, address,
+		    af == AF_INET ? 4 : 16) == 0)
+			return 1;
+	}
+	return 0;
+}
 
 /* Initializes the server options to their default values. */
 
@@ -565,7 +627,7 @@ typedef enum {
 	sX11Forwarding, sX11DisplayOffset, sX11UseLocalhost,
 	sPermitTTY, sStrictModes, sEmptyPasswd, sTCPKeepAlive,
 	sPermitUserEnvironment, sAllowTcpForwarding, sCompression,
-	sForwardHttpProxy, sForwardProxy, sSSHRelayTarget, sAllowUdpForwarding,
+sForwardHttpProxy, sForwardProxy, sForwardProxyBypass, sSSHRelayTarget, sAllowUdpForwarding,
 	sSSHRelayConnectTimeout,
 	sRekeyLimit, sAllowUsers, sDenyUsers, sAllowGroups, sDenyGroups,
 	sIgnoreUserKnownHosts, sCiphers, sMacs, sPidFile, sModuliFile,
@@ -700,6 +762,7 @@ static struct {
 	{ "allowtcpforwarding", sAllowTcpForwarding, SSHCFG_ALL },
 	{ "allowudpforwarding", sAllowUdpForwarding, SSHCFG_ALL },
 	{ "forwardproxy", sForwardProxy, SSHCFG_ALL },
+	{ "forwardproxybypass", sForwardProxyBypass, SSHCFG_ALL },
 	{ "forwardhttpproxy", sForwardHttpProxy, SSHCFG_ALL },
 	{ "sshrelaytarget", sSSHRelayTarget, SSHCFG_GLOBAL },
 	{ "sshrelayconnecttimeout", sSSHRelayConnectTimeout, SSHCFG_GLOBAL },
@@ -2491,6 +2554,30 @@ process_server_config_line_depth(ServerOptions *options, char *line,
 		*inc_flags &= ~SSHCFG_MATCH_ONLY;
 		break;
 
+	case sForwardProxyBypass:
+		found = options->num_forward_proxy_bypass == 0;
+		while ((arg = argv_next(&ac, &av)) != NULL) {
+			if (nstrs >= 16 || (strcmp(arg, "none") != 0 &&
+			    !forward_proxy_bypass_endpoint(arg, NULL, NULL, NULL)) ||
+			    (nstrs != 0 && (strcmp(arg, "none") == 0 ||
+			    strcmp(strs[0], "none") == 0)))
+				fatal("%s line %d: ForwardProxyBypass requires up to "
+				    "16 exact numeric loopback host:port endpoints or none",
+				    filename, linenum);
+			opt_array_append(filename, linenum, keyword,
+			    &strs, &nstrs, arg);
+		}
+		if (nstrs == 0)
+			fatal("%s line %d: ForwardProxyBypass missing argument",
+			    filename, linenum);
+		if (found && *activep) {
+			options->forward_proxy_bypass = strs;
+			options->num_forward_proxy_bypass = nstrs;
+			strs = NULL;
+			nstrs = 0;
+		}
+		break;
+
 	case sPermitListen:
 	case sPermitOpen:
 		if (opcode == sPermitListen) {
@@ -3378,6 +3465,12 @@ dump_config(ServerOptions *o)
 	dump_cfg_fmtint(sAllowTcpForwarding, o->allow_tcp_forwarding);
 	dump_cfg_fmtint(sAllowUdpForwarding, o->allow_udp_forwarding);
 	dump_cfg_string(sForwardProxy, o->forward_http_proxy);
+	printf("forwardproxybypass");
+	if (o->num_forward_proxy_bypass == 0)
+		printf(" none");
+	for (i = 0; i < o->num_forward_proxy_bypass; i++)
+		printf(" %s", o->forward_proxy_bypass[i]);
+	printf("\n");
 	dump_cfg_string(sSSHRelayTarget, o->ssh_relay_target);
 	dump_cfg_fmtint(sAllowAgentForwarding, o->allow_agent_forwarding);
 	dump_cfg_fmtint(sDisableForwarding, o->disable_forwarding);

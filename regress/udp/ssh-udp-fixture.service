@@ -1,0 +1,10 @@
+[Unit]
+Description=Disposable SSH UDP validation daemon
+After=network.target
+[Service]
+Environment=LD_PRELOAD=/opt/ssh-udp-fixture/slow-resolver.so
+ExecStart=/opt/ssh-udp-fixture/sbin/sshd -D -e -f /opt/ssh-udp-fixture/etc/sshd_config
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+[Install]
+WantedBy=multi-user.target

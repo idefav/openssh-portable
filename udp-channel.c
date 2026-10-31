@@ -9,6 +9,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <signal.h>
 #include <netdb.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -23,33 +24,162 @@
 #include "udp-channel.h"
 #include "log.h"
 #include "misc.h"
+#include "canohost.h"
 #include "xmalloc.h"
 
 #define UDP_MAX 65507
 #define UDP_WINDOW (128 * 1024)
 enum { U_CONNECT, U_GREETING_SEND, U_GREETING_RECV, U_AUTH_SEND,
-    U_AUTH_RECV, U_ASSOC_SEND, U_ASSOC_RECV, U_READY };
+    U_AUTH_RECV, U_ASSOC_SEND, U_ASSOC_RECV, U_READY, U_RESOLVE };
+
+#define UDP_RESOLVERS 4
+#define UDP_ADDRESSES 16
+struct udp_addresses {
+	u_int count;
+	struct sockaddr_storage addr[UDP_ADDRESSES];
+	socklen_t len[UDP_ADDRESSES];
+};
 
 struct udp_channel {
-	int state, proxy;
+	int state, proxy, relay, resolve_port, resolve_type;
 	char *user, *password;
+	char *resolve_host;
 	u_char tx[600], rx[600], header[262];
 	size_t txlen, sent, rxlen, headerlen;
 	time_t deadline;
-	struct addrinfo *addresses, *next;
+	struct udp_addresses addresses;
+	size_t resolved_bytes;
+	u_int next;
 };
+
+/* A slot remains occupied until waitpid reaps it, including cancelled work. */
+static struct {
+	pid_t pid;
+	struct udp_channel *owner;
+} udp_resolvers[UDP_RESOLVERS];
+
+int
+udp_channel_child_exited(pid_t pid)
+{
+	int i;
+	for (i = 0; i < UDP_RESOLVERS; i++) {
+		if (udp_resolvers[i].pid == pid) {
+			udp_resolvers[i].pid = 0;
+			udp_resolvers[i].owner = NULL;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static void
+udp_cancel_resolver(struct udp_channel *u)
+{
+	int i;
+	for (i = 0; i < UDP_RESOLVERS; i++) {
+		if (udp_resolvers[i].owner == u) {
+			udp_resolvers[i].owner = NULL;
+			kill(udp_resolvers[i].pid, SIGKILL);
+		}
+	}
+}
+
+static int
+udp_resolve_start(Channel *c)
+{
+	struct udp_channel *u = c->udp;
+	struct udp_addresses result;
+	struct addrinfo hints, *addresses = NULL, *p;
+	char service[16];
+	int i, fds[2];
+	pid_t pid;
+	ssize_t n;
+	size_t sent = 0;
+
+	if (c->rfd != -1)
+		return 0;
+	for (i = 0; i < UDP_RESOLVERS && udp_resolvers[i].pid != 0; i++)
+		;
+	if (i == UDP_RESOLVERS)
+		return 0; /* queued, with the original establishment deadline */
+	if (pipe(fds) == -1)
+		return -1;
+	if ((pid = fork()) == -1) {
+		close(fds[0]); close(fds[1]);
+		return -1;
+	}
+	if (pid == 0) {
+		/* Never retain authenticated SSH transports in the resolver. */
+		if (dup2(fds[1], 3) == -1)
+			_exit(1);
+		closefrom(4);
+		close(0); close(1); close(2);
+		signal(SIGTERM, SIG_DFL);
+		signal(SIGALRM, SIG_DFL);
+		alarm(3);
+		memset(&result, 0, sizeof(result));
+		memset(&hints, 0, sizeof(hints));
+		hints.ai_family = AF_UNSPEC;
+		hints.ai_socktype = u->resolve_type;
+		snprintf(service, sizeof(service), "%d", u->resolve_port);
+		if (getaddrinfo(u->resolve_host, service, &hints, &addresses) == 0) {
+			for (p = addresses; p != NULL && result.count < UDP_ADDRESSES;
+			    p = p->ai_next) {
+				if ((p->ai_family != AF_INET && p->ai_family != AF_INET6) ||
+				    p->ai_addrlen > sizeof(result.addr[0]))
+					continue;
+				result.len[result.count] = p->ai_addrlen;
+				memcpy(&result.addr[result.count++], p->ai_addr, p->ai_addrlen);
+			}
+			freeaddrinfo(addresses);
+		}
+		while (sent < sizeof(result)) {
+			n = write(3, (char *)&result + sent, sizeof(result) - sent);
+			if (n == -1 && errno == EINTR) continue;
+			if (n <= 0) _exit(1);
+			sent += n;
+		}
+		_exit(0);
+	}
+	close(fds[1]);
+	udp_resolvers[i].pid = pid;
+	udp_resolvers[i].owner = u;
+	if (set_nonblock(fds[0]) != 0) {
+		close(fds[0]);
+		udp_cancel_resolver(u);
+		return -1;
+	}
+	c->rfd = fds[0];
+	return 0;
+}
+
+static void
+udp_resolve_queue(Channel *c, const char *host, int port, int type)
+{
+	struct udp_channel *u = c->udp;
+	free(u->resolve_host);
+	u->resolve_host = xstrdup(host);
+	u->resolve_port = port;
+	u->resolve_type = type;
+	u->resolved_bytes = 0;
+	u->next = 0;
+	memset(&u->addresses, 0, sizeof(u->addresses));
+	u->state = U_RESOLVE;
+}
 
 static int
 udp_next_socket(struct udp_channel *u, int type)
 {
-	struct addrinfo *p;
+	struct sockaddr *p;
+	u_int i;
 	int fd = -1;
-	while ((p = u->next) != NULL) {
-		u->next = p->ai_next;
-		if ((fd = socket(p->ai_family, type, 0)) == -1)
+	while (u->next < u->addresses.count) {
+		i = u->next++;
+		p = (struct sockaddr *)&u->addresses.addr[i];
+		if ((fd = socket(p->sa_family, type, 0)) == -1)
 			continue;
-		if (set_nonblock(fd) == 0 && (connect(fd, p->ai_addr,
-		    p->ai_addrlen) == 0 || errno == EINPROGRESS))
+		if (set_nonblock(fd) == 0 && (connect(fd, p,
+		    u->addresses.len[i]) == 0 || errno == EINPROGRESS))
 			break;
 		close(fd);
 		fd = -1;
@@ -57,32 +187,11 @@ udp_next_socket(struct udp_channel *u, int type)
 	return fd;
 }
 
-static int
-udp_socket(const char *host, int port, int type, struct udp_channel *saved)
-{
-	struct udp_channel temporary;
-	struct udp_channel *u = saved;
-	struct addrinfo hints;
-	char service[16];
-	int fd;
-	memset(&temporary, 0, sizeof(temporary));
-	if (u == NULL) u = &temporary;
-	memset(&hints, 0, sizeof(hints));
-	hints.ai_family = AF_UNSPEC;
-	hints.ai_socktype = type;
-	snprintf(service, sizeof(service), "%d", port);
-	if (getaddrinfo(host, service, &hints, &u->addresses) != 0)
-		return -1;
-	u->next = u->addresses;
-	fd = udp_next_socket(u, type);
-	if (saved == NULL) freeaddrinfo(u->addresses);
-	return fd;
-}
-
 static void
 udp_fail(struct ssh *ssh, Channel *c, const char *message)
 {
 	int r;
+	udp_cancel_resolver(c->udp);
 	debug("channel %d: UDP: %s", c->self, message);
 	c->io_want = 0;
 	if (c->type == SSH_CHANNEL_CONNECTING) {
@@ -104,10 +213,9 @@ udp_confirm(struct ssh *ssh, Channel *c)
 {
 	int r;
 	c->udp->state = U_READY;
-	if (c->udp->addresses != NULL) {
-		freeaddrinfo(c->udp->addresses);
-		c->udp->addresses = c->udp->next = NULL;
-	}
+	debug("channel %d: UDP established source port %d, proxy %d",
+	    c->self, get_local_port(c->sock), c->udp->proxy);
+	memset(&c->udp->addresses, 0, sizeof(c->udp->addresses));
 	c->udp->deadline = monotime() + 60;
 	c->type = SSH_CHANNEL_OPEN;
 	if ((r = sshpkt_start(ssh, SSH2_MSG_CHANNEL_OPEN_CONFIRMATION)) != 0 ||
@@ -127,22 +235,14 @@ udp_channel_new(struct ssh *ssh, const char *host, u_short port,
 	struct udp_channel *u;
 	struct in_addr v4;
 	struct in6_addr v6;
-	int fd;
 	size_t n;
 	if ((user != NULL && strlen(user) > 255) ||
 	    (password != NULL && strlen(password) > 255))
 		return NULL;
 	u = xcalloc(1, sizeof(*u));
-	fd = udp_socket(proxy == NULL ? host : proxy,
-	    proxy == NULL ? port : proxyport,
-	    proxy == NULL ? SOCK_DGRAM : SOCK_STREAM, u);
-	if (fd == -1) {
-		if (u->addresses != NULL) freeaddrinfo(u->addresses);
-		free(u);
-		return NULL;
-	}
+	u->deadline = monotime() + 3; /* Includes queueing and every DNS phase. */
 	c = channel_new(ssh, SSH_UDP_CHANNEL, SSH_CHANNEL_CONNECTING,
-	    fd, fd, -1, UDP_WINDOW, CHAN_TCP_PACKET_DEFAULT,
+	    -1, -1, -1, UDP_WINDOW, CHAN_TCP_PACKET_DEFAULT,
 	    CHAN_EXTENDED_IGNORE, "UDP forward", 1);
 	c->path = xstrdup(host);
 	c->host_port = port;
@@ -150,7 +250,9 @@ udp_channel_new(struct ssh *ssh, const char *host, u_short port,
 	u->proxy = proxy != NULL;
 	u->user = user == NULL ? NULL : xstrdup(user);
 	u->password = password == NULL ? NULL : xstrdup(password);
-	u->deadline = monotime() + 3;
+	udp_resolve_queue(c, proxy == NULL ? host : proxy,
+	    proxy == NULL ? port : proxyport,
+	    proxy == NULL ? SOCK_DGRAM : SOCK_STREAM);
 	/* RFC 1928 header, including the three reserved/fragment bytes. */
 	n = 3;
 	if (inet_pton(AF_INET, host, &v4) == 1) {
@@ -175,7 +277,8 @@ udp_channel_free(Channel *c)
 {
 	struct udp_channel *u = c->udp;
 	if (u == NULL) return;
-	if (u->addresses != NULL) freeaddrinfo(u->addresses);
+	udp_cancel_resolver(u);
+	free(u->resolve_host);
 	if (u->user != NULL) freezero(u->user, strlen(u->user));
 	if (u->password != NULL) freezero(u->password, strlen(u->password));
 	freezero(u, sizeof(*u));
@@ -196,6 +299,14 @@ udp_channel_pre(struct ssh *ssh, Channel *c)
 	c->io_want = 0;
 	if (monotime() >= u->deadline) {
 		udp_fail(ssh, c, "UDP timeout");
+		return;
+	}
+	if (u->state == U_RESOLVE) {
+		if (udp_resolve_start(c) == -1) {
+			udp_fail(ssh, c, "UDP resolver unavailable");
+			return;
+		}
+		if (c->rfd != -1) c->io_want = SSH_CHAN_IO_RFD;
 		return;
 	}
 	if (u->state != U_READY) {
@@ -275,7 +386,43 @@ udp_relay_socket(Channel *c, int end)
 		    &plen) == -1 || getnameinfo((struct sockaddr *)&peer, plen,
 		    host, sizeof(host), NULL, 0, NI_NUMERICHOST) != 0)) return -1;
 	}
-	return udp_socket(host, port, SOCK_DGRAM, NULL);
+	c->efd = c->sock; /* Retain the authenticated SOCKS association. */
+	c->sock = c->rfd = c->wfd = -1;
+	u->relay = 1;
+	udp_resolve_queue(c, host, port, SOCK_DGRAM);
+	return 0;
+}
+
+static void
+udp_resolve_read(struct ssh *ssh, Channel *c)
+{
+	struct udp_channel *u = c->udp;
+	struct sockaddr *a;
+	ssize_t n;
+	u_int i;
+	int fd;
+	if (!(c->io_ready & SSH_CHAN_IO_RFD)) return;
+	n = read(c->rfd, (char *)&u->addresses + u->resolved_bytes,
+	    sizeof(u->addresses) - u->resolved_bytes);
+	if (n == -1 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) return;
+	if (n <= 0) goto fail;
+	u->resolved_bytes += n;
+	if (u->resolved_bytes != sizeof(u->addresses)) return;
+	close(c->rfd);
+	c->rfd = -1;
+	if (u->addresses.count == 0 || u->addresses.count > UDP_ADDRESSES) goto fail;
+	for (i = 0; i < u->addresses.count; i++) {
+		a = (struct sockaddr *)&u->addresses.addr[i];
+		if (!((a->sa_family == AF_INET && u->addresses.len[i] == sizeof(struct sockaddr_in)) ||
+		    (a->sa_family == AF_INET6 && u->addresses.len[i] == sizeof(struct sockaddr_in6))))
+			goto fail;
+	}
+	if ((fd = udp_next_socket(u, u->resolve_type)) == -1) goto fail;
+	c->sock = c->rfd = c->wfd = fd;
+	u->state = U_CONNECT;
+	return;
+ fail:
+	udp_fail(ssh, c, "UDP name resolution failed");
 }
 
 static void
@@ -289,13 +436,13 @@ udp_handshake(struct ssh *ssh, Channel *c)
 	if (u->state == U_CONNECT) {
 		if (!(c->io_ready & SSH_CHAN_IO_WFD)) return;
 		if (getsockopt(c->sock, SOL_SOCKET, SO_ERROR, &err, &elen) == -1 || err != 0) {
-			fd = udp_next_socket(u, u->proxy ? SOCK_STREAM : SOCK_DGRAM);
+			fd = udp_next_socket(u, u->resolve_type);
 			if (fd == -1) goto fail;
 			close(c->sock);
 			c->sock = c->rfd = c->wfd = fd;
 			return;
 		}
-		if (!u->proxy) { udp_confirm(ssh, c); return; }
+		if (!u->proxy || u->relay) { udp_confirm(ssh, c); return; }
 		u->tx[0] = 5; u->tx[1] = 1; u->tx[2] = u->user == NULL ? 0 : 2;
 		u->txlen = 3; u->state = U_GREETING_SEND;
 	}
@@ -332,10 +479,7 @@ udp_handshake(struct ssh *ssh, Channel *c)
 		end = udp_address_end(u->rx, u->rxlen, 3);
 		if (end == 0) return;
 		if (end < 0 || u->rxlen != (size_t)end) goto fail;
-		if ((fd = udp_relay_socket(c, end)) == -1) goto fail;
-		c->efd = c->sock; /* Keep TCP association alive and poll for closure. */
-		c->sock = c->rfd = c->wfd = fd;
-		udp_confirm(ssh, c);
+		if (udp_relay_socket(c, end) == -1) goto fail;
 	}
 	return;
  fail:
@@ -353,6 +497,7 @@ udp_channel_post(struct ssh *ssh, Channel *c)
 	ssize_t n;
 	size_t len, offset;
 	int r, end;
+	if (u->state == U_RESOLVE) { udp_resolve_read(ssh, c); return; }
 	if (u->state != U_READY) { udp_handshake(ssh, c); return; }
 	if (c->io_ready & SSH_CHAN_IO_EFD_R) {
 		n = read(c->efd, packet, 1);

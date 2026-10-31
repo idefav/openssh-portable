@@ -65,6 +65,7 @@
 #include "canohost.h"
 #include "sshpty.h"
 #include "channels.h"
+#include "udp-channel.h"
 #include "ssh2.h"
 #include "sshkey.h"
 #include "cipher.h"
@@ -324,7 +325,7 @@ collect_children(struct ssh *ssh)
 		debug("Received SIGCHLD.");
 		while ((pid = waitpid(-1, &status, WNOHANG)) > 0 ||
 		    (pid == -1 && errno == EINTR))
-			if (pid > 0)
+			if (pid > 0 && !udp_channel_child_exited(pid))
 				session_close_by_pid(ssh, pid, status);
 		child_terminated = 0;
 	}
@@ -446,7 +447,8 @@ server_request_direct_tcpip(struct ssh *ssh, int *reason, const char **errmsg)
 	if ((options.allow_tcp_forwarding & FORWARD_LOCAL) != 0 &&
 	    auth_opts->permit_port_forwarding_flag &&
 	    !options.disable_forwarding) {
-		if (options.forward_http_proxy != NULL) {
+		if (options.forward_http_proxy != NULL &&
+		    !forward_proxy_bypass_matches(&options, target, target_port)) {
 			c = channel_connect_to_port_via_proxy(ssh,
 			    target, target_port, options.forward_http_proxy,
 			    "direct-tcpip", "direct-tcpip", reason, errmsg);
@@ -819,6 +821,34 @@ server_input_global_request(int type, u_int32_t seq, struct ssh *ssh)
 		resp = sshbuf_new();
 		if (resp == NULL || (r = sshbuf_put_u8(resp, status)) != 0)
 			fatal("UDP capability response");
+		success = 1;
+	} else if (strcmp(rtype, "forward-proxy-info-v1@idefav.github.io") == 0) {
+		u_int i, count = options.num_forward_proxy_bypass;
+		u_char reason = 0;
+		if ((r = sshpkt_get_end(ssh)) != 0)
+			sshpkt_fatal(ssh, r, "forward proxy policy request");
+		if (count == 1 && strcmp(options.forward_proxy_bypass[0], "none") == 0)
+			count = 0;
+		resp = sshbuf_new();
+		if (resp == NULL || sshbuf_put_u32(resp, 1) != 0 ||
+		    sshbuf_put_u8(resp, options.forward_http_proxy != NULL) != 0 ||
+		    sshbuf_put_u32(resp, count) != 0)
+			fatal("forward proxy policy response");
+		for (i = 0; i < count; i++) {
+			if (sshbuf_put_cstring(resp, options.forward_proxy_bypass[i]) != 0)
+				fatal("forward proxy policy endpoint");
+		}
+		if (options.disable_forwarding)
+			reason = 2;
+		else if (!options.allow_udp_forwarding)
+			reason = 1;
+		else if (!auth_opts->permit_port_forwarding_flag)
+			reason = 3;
+		else if (options.forward_http_proxy != NULL &&
+		    strncasecmp(options.forward_http_proxy, "socks5://", 9) != 0)
+			reason = 4;
+		if (sshbuf_put_u8(resp, reason) != 0)
+			fatal("forward proxy policy reason");
 		success = 1;
 	} else if (strcmp(rtype, "tcpip-forward") == 0) {
 		if ((r = sshpkt_get_cstring(ssh, &fwd.listen_host, NULL)) != 0 ||

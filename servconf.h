@@ -167,6 +167,8 @@ typedef struct {
 	int	allow_streamlocal_forwarding; /* One of FORWARD_* */
 	int	allow_agent_forwarding;
 	char	*forward_http_proxy; /* optional upstream proxy for direct-tcpip */
+	u_int	num_forward_proxy_bypass;
+	char	**forward_proxy_bypass; /* exact numeric loopback endpoints */
 	char	*ssh_relay_target; /* optional transparent SSH relay target */
 	int	ssh_relay_connect_timeout;
 	int	disable_forwarding;
@@ -306,6 +308,7 @@ TAILQ_HEAD(include_list, include_item);
 		M_CP_STROPT(ca_sign_algorithms); \
 		M_CP_STROPT(routing_domain); \
 		M_CP_STROPT(forward_http_proxy); \
+		M_CP_STRARRAYOPT(forward_proxy_bypass, num_forward_proxy_bypass, 1); \
 		M_CP_STROPT(permit_user_env_allowlist); \
 		M_CP_STROPT(pam_service_name); \
 		M_CP_STRARRAYOPT(authorized_keys_files, num_authkeys_files, 1);\
@@ -341,6 +344,7 @@ int	 parse_server_match_testspec(struct connection_info *, char *);
 void	 servconf_merge_subsystems(ServerOptions *, ServerOptions *);
 void	 copy_set_server_options(ServerOptions *, ServerOptions *, int);
 void	 dump_config(ServerOptions *);
+int	 forward_proxy_bypass_matches(const ServerOptions *, const char *, int);
 char	*derelativise_path(const char *);
 void	 servconf_add_hostkey(const char *, const int,
 	    ServerOptions *, const char *path, int);

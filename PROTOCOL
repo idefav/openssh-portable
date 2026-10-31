@@ -774,4 +774,40 @@ and the existing PermitOpen host/port ACL apply to both transports.
 SSHRelayTarget only relays the encrypted byte stream and needs no UDP
 extension at intermediate hops; the final authenticated server does.
 
+UDP establishment resolves the direct target, SOCKS5 proxy host and any
+SOCKS5 relay domain in child processes. At most four resolvers are active
+per authenticated SSH process; other channels wait within their original
+three-second establishment deadline. The deadline includes queueing, all
+DNS work and SOCKS negotiation. Fixed-size address results arrive through
+nonblocking pipes. Timeout and channel teardown kill the task; the normal
+SIGCHLD collector reaps it before its slot can be reused. Resolution stays
+on the server and does not change PermitOpen's original host/port checks.
+
+7. Private fork extension: authenticated ForwardProxy policy v1
+
+An authenticated client may send an empty global request named
+"forward-proxy-info-v1@idefav.github.io", with want-reply true. A supporting
+server replies SUCCESS followed by:
+    uint32  policy format version (1)
+    boolean ForwardProxy is configured for this authenticated session
+    uint32  number of effective ForwardProxyBypass endpoints (0..16)
+    string  endpoint (repeated count times)
+    byte    UDP restriction detail (optional for early policy implementations)
+
+The restriction detail is 0=enabled, 1=AllowUdpForwarding disabled,
+2=DisableForwarding, 3=authenticated key forbids port forwarding,
+4=unsupported ForwardProxy type. It refines the original UDP capability
+status; it does not replace that status or evaluate per-destination ACLs.
+
+SUCCESS also declares support for ForwardProxyBypass. Endpoints are exact
+numeric loopback host:port pairs, IPv6 enclosed in brackets. A default or
+explicit "none" setting has count zero. No proxy URL, username, password
+or key material is returned. Unsupported requests return REQUEST_FAILURE;
+this must not be interpreted as evidence that ForwardProxy is disabled.
+The existing UDP v1 capability response remains exactly one byte.
+
+ForwardProxyBypass changes direct-tcpip connection selection only. All
+ordinary TCP forwarding and destination/key ACL checks still run. A
+matching exception is not a UDP permission grant or an egress guarantee.
+
 $OpenBSD: PROTOCOL,v 1.60 2026/02/09 22:09:48 dtucker Exp $

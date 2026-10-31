@@ -237,6 +237,27 @@ The legacy keyword
 .Cm ForwardHttpProxy
 is accepted as an alias for
 .Cm ForwardProxy .
+.It Cm ForwardProxyBypass
+Specifies up to 16 exact numeric loopback address and port pairs that bypass
+.Cm ForwardProxy
+for direct TCP forwarding, for example
+.Dq 127.0.0.1:7300
+or
+.Dq [::1]:7300 .
+The default is
+.Cm none .
+Host names, wildcards, address ranges, non-loopback addresses and wildcard
+ports are not accepted. IPv4 addresses must be in 127.0.0.0/8; the only
+accepted IPv6 address is ::1. This keyword is allowed in
+.Cm Match
+blocks.
+The exception changes only the connection path. It does not override
+.Cm AllowTcpForwarding ,
+.Cm DisableForwarding ,
+.Cm PermitOpen
+or authorized key restrictions. It does not affect custom UDP forwarding.
+A UDP gateway reached through this exception sends UDP using its own
+server-side sockets, not through the SSH server's ForwardProxy upstream.
 .It Cm SSHRelayTarget
 Specifies a fixed SSH server to which all connections accepted by this
 .Nm sshd

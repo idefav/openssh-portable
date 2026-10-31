@@ -5,3 +5,4 @@ void udp_channel_pre(struct ssh *, Channel *);
 void udp_channel_post(struct ssh *, Channel *);
 void udp_channel_free(Channel *);
 time_t udp_channel_expiry(Channel *);
+int udp_channel_child_exited(pid_t);
